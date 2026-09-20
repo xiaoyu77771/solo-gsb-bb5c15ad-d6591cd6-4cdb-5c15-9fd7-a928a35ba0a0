@@ -10,16 +10,18 @@
 
 原名始终原样落库，规范名（`normalized_name`）一并保存；`(namespace, normalized_name)` 在数据库层有唯一约束兜底并发写入。每条记录带单调递增的 `revision`（初始为 1），作为乐观锁版本号。
 
-还支持**命名空间级混脚本策略**：`PUT /namespaces/{namespace}/script-policy` 接收**无序且去重**的 `blocked_script_pairs`（每对为两个不同的合法 Unicode 脚本名，空列表表示不拦截任何组合）与 `expected_revision`，在**单个 `BEGIN IMMEDIATE` 事务**中校验版本（未配置时当前版本按 `0` 计，首次配置必须传 `0`，成功后 `revision=1`，之后每次成功 PUT 递增），并用新策略扫描该空间**全部已注册名称与有效预占**（先惰性清理过期预占）；若新策略会使现存名称违规，返回 `409 script_policy_conflict` 并逐条给出违规记录（`kind` 区分 `registered` / `reservation`）、命中的脚本对与码点明细，**策略不更新**；全部通过才写入。`GET /namespaces/{namespace}/script-policy` 读取已配置策略（未配置返回 `404`，但写入与 `check` 仍按内建默认策略判定）。注册、批量注册、预占、改名与 `check` 均按**所属命名空间**的生效策略判定，写事务内会重新加载策略复查，使并发的策略修改与名称写入互不破坏；合并时以**目标命名空间**的策略检查源、目标两侧数据。
+还支持**命名空间级混脚本策略**：`PUT /namespaces/{namespace}/script-policy` 接收**无序且去重**的 `blocked_script_pairs`（每对为两个不同的合法 Unicode 脚本名，空列表表示不拦截任何组合）与 `expected_revision`，在**单个 `BEGIN IMMEDIATE` 事务**中校验版本（未配置时当前版本按 `0` 计，首次配置必须传 `0`，成功后 `revision=1`，之后每次成功 PUT 递增），并用新策略扫描该空间**全部已注册名称、有效预占与未过期释放冷却**（先惰性清理过期记录）；若新策略会使现存名称违规，返回 `409 script_policy_conflict` 并逐条给出违规记录（`kind` 区分 `registered` / `reservation` / `released`，后两者附 `expires_at`）、命中的脚本对与码点明细，**策略不更新**；全部通过才写入。`GET /namespaces/{namespace}/script-policy` 读取已配置策略（未配置返回 `404`，但写入与 `check` 仍按内建默认策略判定）。注册、批量注册、预占、改名与 `check` 均按**所属命名空间**的生效策略判定，写事务内会重新加载策略复查，使并发的策略修改与名称写入互不破坏；合并时以**目标命名空间**的策略检查源、目标两侧数据。
 
 
-此外支持**原子改名**：`PATCH /namespaces/{namespace}/names/{id}` 凭上次读取到的 `expected_revision` 修改已注册名称。改名在单个 `BEGIN IMMEDIATE` 写锁事务中完成版本校验与冲突复查（混脚本 / 规范名 / 同形，复查时排除当前记录自身，但仍包含全部有效预占）；成功后保留 `id` / `created_at`、更新原名与规范名并把 `revision + 1`，版本过期返回 `409 stale_revision`。
+此外支持**原子改名**：`PATCH /namespaces/{namespace}/names/{id}` 凭上次读取到的 `expected_revision` 修改已注册名称。改名在单个 `BEGIN IMMEDIATE` 写锁事务中完成版本校验与冲突复查（混脚本 / 规范名 / 同形，复查时排除当前记录自身，但仍包含全部有效预占与未过期释放冷却）；成功后保留 `id` / `created_at`、更新原名与规范名并把 `revision + 1`，版本过期返回 `409 stale_revision`。
 
 还支持**原子交换**：`POST /namespaces/{namespace}/names/swap` 在单个 `BEGIN IMMEDIATE` 写锁事务中校验同命名空间内**两条不同**记录的归属与双方 `expected_revision`，通过后把双方的 `original_name` 与 `normalized_name` **成对互换**、双方 `revision` 各 + 1，`id` / `created_at` 不变。任一记录不存在（或不属于该命名空间）返回 `404`；任一方版本过期返回 `409 stale_revision` 并同时给出双方当前 revision；任何失败都整体回滚，不存在部分更新。
 
 还支持**预占后确认注册**：先 `POST .../reservations` 拿到不可猜测的 token 与过期时间，在 TTL（30–600 秒）内调用 `.../reservations/{token}/claim` 确认。**未过期且未消费的预占与已注册名称完全等价地参与冲突判定**（单条注册、批量注册、新预占、改名、`check` 均会命中），确认成功后才真正写入 `display_names`；过期记录在后续写入时惰性清理。
 
-还支持**命名空间合并**：`POST /namespaces/{source}/merge` 把源命名空间的全部已注册名称与预占记录整体迁入目标命名空间。合并前在写锁事务中对**两侧**的已注册名称与有效预占做跨空间规范名 / 同形复查，并以**目标命名空间的混脚本策略**扫描源、目标两侧数据；冲突或脚本违规任一存在即返回 `409`（分别附 `conflicts` 双方记录与 `script_violations` 逐条明细）且不修改任何数据；无冲突且两侧数据均合规才在同一事务内完成迁移并返回迁移数量。
+还支持**名称释放冷却**：`DELETE /namespaces/{namespace}/names/{id}` 接收 `expected_revision` 与 `cooldown_seconds`（60–86400 秒），在**单个 `BEGIN IMMEDIATE` 事务**内校验归属与版本，通过后删除已注册名称并写入一条带 `expires_at` 的冷却记录（`200` 返回该记录）。**未过期冷却记录与已注册名称、有效预占完全等价地参与全部判定**：单条 / 批量注册、预占、确认（claim）、改名、`check` 的规范名 / 同形查重，命名空间合并的跨空间复查与整体迁移，以及脚本策略 PUT 的混脚本影响面扫描；冲突明细以 `source="released"`（合并 / 策略明细中为 `kind="released"`）标识并附 `expires_at`。记录不存在 / 不属于该命名空间 -> `404`，版本过期 -> `409 stale_revision`。过期冷却不参与判定，在后续写事务开始时惰性物理删除；`GET /namespaces/{namespace}/cooldowns` 列出指定命名空间的有效冷却记录（只读，不清理）。
+
+还支持**命名空间合并**：`POST /namespaces/{source}/merge` 把源命名空间的全部已注册名称、有效预占与释放冷却记录整体迁入目标命名空间。合并前在写锁事务中对**两侧**的已注册名称、有效预占与未过期冷却做跨空间规范名 / 同形复查（过期记录先惰性清理），并以**目标命名空间的混脚本策略**扫描源、目标两侧数据；冲突或脚本违规任一存在即返回 `409`（分别附 `conflicts` 双方记录与 `script_violations` 逐条明细）且不修改任何数据；无冲突且两侧数据均合规才在同一事务内完成迁移并返回迁移数量（含 `merged_cooldowns`）。
 
 ## 快速开始（Docker，单条命令）
 
@@ -27,7 +29,7 @@
 docker compose up --build
 ```
 
-该命令完成镜像构建、依赖安装与数据库初始化（应用启动时自动建库建表，**含向预占表 `name_reservations`、`display_names.revision` 乐观锁列及命名空间策略表 `namespace_script_policies` 的幂等迁移**，升级老版本数据库无需手动执行 SQL；SQLite 文件落在命名卷 `names-data` 中）。容器启动后即可直接使用全部接口（含 `PUT/GET /namespaces/{namespace}/script-policy` 与 `POST /namespaces/{source}/merge`）。
+该命令完成镜像构建、依赖安装与数据库初始化（应用启动时自动建库建表，**含向预占表 `name_reservations`、`display_names.revision` 乐观锁列、命名空间策略表 `namespace_script_policies` 及释放冷却表 `name_cooldowns` 的幂等迁移**，升级老版本数据库无需手动执行 SQL；SQLite 文件落在命名卷 `names-data` 中）。容器启动后即可直接使用全部接口（含 `PUT/GET /namespaces/{namespace}/script-policy`、`POST /namespaces/{source}/merge` 与 `DELETE /namespaces/{namespace}/names/{id}` 释放冷却）。
 
 - **API 地址：http://localhost:8000**
 - **交互式文档（Swagger UI）：http://localhost:8000/docs**
@@ -47,25 +49,27 @@ uvicorn app.main:app --reload --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/namespaces/{namespace}/names` | 注册显示名：`201` 成功；`409` 规范名相同或同形冲突（含有效预占）；`422` 混脚本违规 |
-| `PATCH` | `/namespaces/{namespace}/names/{id}` | **原子改名**：`{"name": ..., "expected_revision": ...}`，单个写锁事务内校验版本、混脚本与冲突（排除当前记录，含有效预占）→ 成功 `200`（保留 `id`/`created_at`，`revision + 1`）；记录不存在/不属于该命名空间 → `404`；版本过期 → `409 stale_revision`；名称冲突 → `409`（沿用冲突明细）；混脚本 → `422` |
-| `POST` | `/namespaces/{namespace}/names/batch` | 批量注册（1–50 个）：全部通过才在**单个事务**中落库 → `201`；任一项混脚本或与库内/有效预占/批内名称冲突 → `422` 汇总明细；并发竞争使判定失效 → 回滚重新分析 → `409` |
+| `PATCH` | `/namespaces/{namespace}/names/{id}` | **原子改名**：`{"name": ..., "expected_revision": ...}`，单个写锁事务内校验版本、混脚本与冲突（排除当前记录，含有效预占与释放冷却）→ 成功 `200`（保留 `id`/`created_at`，`revision + 1`）；记录不存在/不属于该命名空间 → `404`；版本过期 → `409 stale_revision`；名称冲突 → `409`（沿用冲突明细）；混脚本 → `422` |
+| `DELETE` | `/namespaces/{namespace}/names/{id}` | **释放名称并设置冷却**：`{"expected_revision": ..., "cooldown_seconds": 60–86400}`，单个写锁事务内校验归属与版本后删除名称、写入带 `expires_at` 的冷却记录 → 成功 `200`（返回冷却记录）；记录不存在/不属于该命名空间 → `404`；版本过期 → `409 stale_revision`；`cooldown_seconds` 越界 → `422` |
+| `GET` | `/namespaces/{namespace}/cooldowns` | 列出命名空间内仍有效的**释放冷却记录**（`id` / 原名 / 规范名 / `cooldown_seconds` / `expires_at`，按 id 升序）；过期记录不出现（只读不清理），命名空间无记录时返回 `[]` |
+| `POST` | `/namespaces/{namespace}/names/batch` | 批量注册（1–50 个）：全部通过才在**单个事务**中落库 → `201`；任一项混脚本或与库内/有效预占/释放冷却/批内名称冲突 → `422` 汇总明细；并发竞争使判定失效 → 回滚重新分析 → `409` |
 | `POST` | `/namespaces/{namespace}/names/swap` | **原子交换**：`{"records":[{"id":...,"expected_revision":...},{...}]}`（恰好两条不同记录），单个写锁事务内校验双方归属与版本 → 成功 `200`（成对互换原名/规范名，双方 `revision + 1`，`id`/`created_at` 不变）；任一记录不存在/不属于该命名空间 → `404`（附 `missing_ids`）；任一方版本过期 → `409 stale_revision`（附双方当前 revision） |
 | `POST` | `/namespaces/{namespace}/reservations` | **预占**名称：`{"name": ..., "ttl_seconds": 30–600}` → `201` 返回不可猜测 `token` 与 `expires_at`；冲突 → `409`；混脚本 / TTL 越界 → `422` |
 | `POST` | `/namespaces/{namespace}/reservations/{token}/claim` | **确认预占**：单个 `BEGIN IMMEDIATE` 事务内校验命名空间（`404`）、有效期（过期 `410`）、消费状态（重复/并发确认 `409`）与当前冲突（`409`，不写入），通过后注册并标记已消费 → `201` |
-| `POST` | `/namespaces/{source}/merge` | **合并命名空间**：`{"target_namespace": ...}`，写锁事务内复查源与目标两侧的已注册名称与有效预占，并以**目标空间策略**检查两侧混脚本 → 有冲突或违规 `409`（`conflicts` 附双方记录、`script_violations` 附逐条明细，不改数据）；无冲突且两侧合规则同事务迁移并返回迁移数量 → `200`；目标与源相同 → `422` |
-| `PUT` | `/namespaces/{namespace}/script-policy` | **配置混脚本策略**：`{"blocked_script_pairs": [["Latin","Cyrillic"], ...], "expected_revision": ...}`（脚本对无序、自动去重，空列表表示全部放行；未配置时当前版本为 0），单个写锁事务内校验版本并扫描该空间已注册名称与有效预占 → 成功 `200`（首次 `revision=1`，之后递增）；版本过期 → `409 stale_revision`（附 `current_revision`）；新策略会使现存名称违规 → `409 script_policy_conflict`（附逐条违规明细，不更新）；脚本名未知 / 同名对 / 项长度不为 2 / 超过 500 对 → `422` |
+| `POST` | `/namespaces/{source}/merge` | **合并命名空间**：`{"target_namespace": ...}`，写锁事务内复查源与目标两侧的已注册名称、有效预占与释放冷却，并以**目标空间策略**检查两侧混脚本 → 有冲突或违规 `409`（`conflicts` 附双方记录、`script_violations` 附逐条明细，不改数据）；无冲突且两侧合规则同事务迁移并返回迁移数量 → `200`；目标与源相同 → `422` |
+| `PUT` | `/namespaces/{namespace}/script-policy` | **配置混脚本策略**：`{"blocked_script_pairs": [["Latin","Cyrillic"], ...], "expected_revision": ...}`（脚本对无序、自动去重，空列表表示全部放行；未配置时当前版本为 0），单个写锁事务内校验版本并扫描该空间已注册名称、有效预占与释放冷却 → 成功 `200`（首次 `revision=1`，之后递增）；版本过期 → `409 stale_revision`（附 `current_revision`）；新策略会使现存名称违规 → `409 script_policy_conflict`（附逐条违规明细，不更新）；脚本名未知 / 同名对 / 项长度不为 2 / 超过 500 对 → `422` |
 | `GET` | `/namespaces/{namespace}/script-policy` | 读取已配置的混脚本策略 → `200`；命名空间尚未配置 → `404`（写入与 `check` 此时仍按内建默认策略判定） |
-| `POST` | `/namespaces/{namespace}/check` | **只分析不落库**：返回规范名、脚本分析、码点、生效策略（`blocked_script_pairs`）、命中的脚本对（`violating_script_pairs`）与潜在冲突（含有效预占） |
+| `POST` | `/namespaces/{namespace}/check` | **只分析不落库**：返回规范名、脚本分析、码点、生效策略（`blocked_script_pairs`）、命中的脚本对（`violating_script_pairs`）与潜在冲突（含有效预占与释放冷却） |
 | `GET` | `/namespaces/{namespace}/names` | 列出命名空间内已注册名称（预占未确认前不出现在此） |
 | `GET` | `/health` | 健康检查 |
 
-单条接口请求体为 `{"name": "<显示名>"}`（1–64 字符，非空白）；改名接口为 `{"name": "<新显示名>", "expected_revision": <上次读取的 revision，≥1 的整数>}`；交换接口为 `{"records": [{"id": <记录 id>, "expected_revision": <≥1 的整数>}, ...]}`（**恰好两条，且 id 不能相同**，响应 `items` 按请求顺序返回）；批量接口为 `{"names": ["<显示名>", ...]}`（1–50 个）；预占接口为 `{"name": "<显示名>", "ttl_seconds": 30–600}`；合并接口为 `{"target_namespace": "<目标命名空间>"}`（1–64 字符，非空白，且不得与源相同）。
+单条接口请求体为 `{"name": "<显示名>"}`（1–64 字符，非空白）；改名接口为 `{"name": "<新显示名>", "expected_revision": <上次读取的 revision，≥1 的整数>}`；删除（释放）接口为 `{"expected_revision": <≥1 的整数>, "cooldown_seconds": <60–86400 的整数>}`；交换接口为 `{"records": [{"id": <记录 id>, "expected_revision": <≥1 的整数>}, ...]}`（**恰好两条，且 id 不能相同**，响应 `items` 按请求顺序返回）；批量接口为 `{"names": ["<显示名>", ...]}`（1–50 个）；预占接口为 `{"name": "<显示名>", "ttl_seconds": 30–600}`；合并接口为 `{"target_namespace": "<目标命名空间>"}`（1–64 字符，非空白，且不得与源相同）。
 
 策略接口请求体为 `{"blocked_script_pairs": [["<脚本A>", "<脚本B>"], ...], "expected_revision": <≥0 的整数>}`：脚本名大小写敏感、取 Unicode `Script` 属性值（如 `Latin` / `Cyrillic` / `Greek` / `Han` / `Arabic`，不接受 `Common` / `Inherited` / `Unknown`）；**每一对内部顺序无关、整体自动去重**（`["Cyrillic","Latin"]` 与 `["Latin","Cyrillic"]` 等价），响应中统一按字典序排列返回；至多 500 对。命名空间**首次**配置必须传 `expected_revision: 0`，之后传上次 GET/PUT 返回的 `revision`。
 
 混脚本错误明细（`422`）与 `check` 响应统一新增：`blocked_script_pairs`（本次判定生效的策略对；未配置时为内建默认三对）与 `violating_script_pairs`（名称实际命中的阻断脚本对，非空即违规）；历史字段 `restricted_scripts_used`（出现的 Latin/Cyrillic/Greek）保持不变。
 
-冲突明细中的 `source` 字段区分冲突来源：`registered`（已注册名称，默认值，老客户端无需改动）或 `reservation`（有效预占，附带该预占的 `expires_at`）。
+冲突明细中的 `source` 字段区分冲突来源：`registered`（已注册名称，默认值，老客户端无需改动）、`reservation`（有效预占，附带该预占的 `expires_at`）或 `released`（未过期释放冷却记录，附带冷却到期时刻 `expires_at`）。命名空间合并的跨空间明细与脚本策略扫描明细则用 `kind` 字段区分同一组三类来源。
 
 ### 示例
 
@@ -137,6 +141,58 @@ curl -X PATCH http://localhost:8000/namespaces/chat/names/1 \
 # 记录 id 不存在，或 id 属于其他命名空间 -> 404
 # 404 {"detail":{"error":"name_not_found","message":"已注册名称不存在，或不属于该命名空间"}}
 ```
+
+删除（释放）名称并设置冷却：删除与冷却写入在同一个 `BEGIN IMMEDIATE`
+事务中完成，成功返回带 `expires_at` 的冷却记录，原名称立即从已注册列表消失：
+
+```bash
+curl -X DELETE http://localhost:8000/namespaces/chat/names/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 2, "cooldown_seconds": 3600}'
+# 200 {"id":1,"namespace":"chat","original_name":"payfriend",
+#      "normalized_name":"payfriend","cooldown_seconds":3600,
+#      "expires_at":"2026-09-20T13:00:00.000Z","created_at":"..."}
+```
+
+冷却到期前，规范名相同或同形的名称在**所有**入口都会冲突（注意新的
+`source` 字段；冷却同样阻止预占、确认、改名、批量注册与跨空间合并）：
+
+```bash
+curl -X POST http://localhost:8000/namespaces/chat/names \
+  -H 'Content-Type: application/json' -d '{"name": "PAYFRIEND"}'
+# 409 {"detail":{"error":"name_conflict","normalized_name":"payfriend",
+#      "conflicts":[{"id":1,"original_name":"payfriend","reason":"normalized_match",
+#                    "source":"released",
+#                    "expires_at":"2026-09-20T13:00:00.000Z"}]}}
+```
+
+查看命名空间内仍有效的冷却记录（过期记录不出现；只读接口不做物理清理）：
+
+```bash
+curl http://localhost:8000/namespaces/chat/cooldowns
+# 200 [{"id":1,"namespace":"chat","original_name":"payfriend",
+#       "normalized_name":"payfriend","cooldown_seconds":3600,
+#       "expires_at":"2026-09-20T13:00:00.000Z","created_at":"..."}]
+```
+
+释放接口的错误语义（全部在单个 `BEGIN IMMEDIATE` 事务内判定，失败不产生
+“名称已删除但无冷却”的部分更新）：
+
+```bash
+# 记录 id 不存在，或属于其他命名空间 -> 404
+# 404 {"detail":{"error":"name_not_found","message":"已注册名称不存在，或不属于该命名空间"}}
+
+# expected_revision 已过期 -> 409，附当前版本供重读后重试
+# 409 {"detail":{"error":"stale_revision",
+#      "message":"名称记录已被其他请求修改，请重新读取最新版本后重试",
+#      "current_revision":3}}
+
+# cooldown_seconds 超出 60–86400 范围，或 expected_revision < 1 -> 422
+```
+
+冷却到期后记录在**下一次写操作**（注册 / 批量 / 预占 / 确认 / 改名 / 交换 /
+释放 / 合并 / 策略 PUT）开始时被惰性物理删除，此后名称可被重新注册；只读的
+`check` 与冷却列表接口会过滤过期记录但不删除它们。
 
 原子交换：在同一个 `BEGIN IMMEDIATE` 写锁事务中校验双方归属与版本，把两条记录的
 原名 / 规范名**成对互换**，双方 `revision` 各 + 1，`id` / `created_at` 保持不变，
@@ -296,7 +352,7 @@ curl -X POST "http://localhost:8000/namespaces/chat/reservations/${TOKEN}/claim"
 curl -X POST http://localhost:8000/namespaces/a/merge \
   -H 'Content-Type: application/json' -d '{"target_namespace": "b"}'
 # 200 {"source_namespace":"a","target_namespace":"b",
-#      "merged_names":2,"merged_reservations":1}
+#      "merged_names":2,"merged_reservations":1,"merged_cooldowns":0}
 ```
 
 合并前冲突：源空间 `a` 的 `app` 与目标空间 `b` 的纯西里尔 `арр` 同形 → `409`，
@@ -405,14 +461,15 @@ curl -X POST http://localhost:8000/namespaces/a/merge \
 ## 判定规则说明
 
 1. **规范化**：`unicodedataplus.normalize("NFKC", name).casefold()`。NFKC 折叠全半角、合字等兼容字符，casefold 折叠大小写（比 lower 更彻底，如 `ß`→`ss`）。
-2. **冲突检测**：候选规范名与同命名空间内每条**已注册名称**及**未过期、未消费预占**比较——完全相等记为 `normalized_match`；否则用 `confusables.is_confusable` 做基于 Unicode `confusables.txt` 的同形判定，命中记为 `confusable`。冲突记录以 `source`（`registered` / `reservation`，后者附 `expires_at`）区分来源。命名空间之间相互隔离。
+2. **冲突检测**：候选规范名与同命名空间内每条**已注册名称**、**未过期、未消费预占**及**未过期释放冷却记录**比较——完全相等记为 `normalized_match`；否则用 `confusables.is_confusable` 做基于 Unicode `confusables.txt` 的同形判定，命中记为 `confusable`。冲突记录以 `source`（`registered` / `reservation` / `released`，后两者附 `expires_at`）区分来源。命名空间之间相互隔离。
 3. **混脚本检测**：逐字符取 `unicodedataplus.script()`，忽略 `Common`（数字、标点、空白等）与 `Inherited`（组合符）后，按**所属命名空间的生效策略**判定：名称中同时出现 `blocked_script_pairs` 里某一对的两个脚本，即记为该对命中，命中至少一对即违规；`violating_script_pairs` 给出实际命中的脚本对子集。命名空间未配置策略时使用内建默认策略——Latin / Cyrillic / Greek 三对全阻断（即三者中出现两种及以上即违规），故纯西里尔、纯希腊或与 Han 等其他脚本混用在默认策略下不触发本规则（仍受同形判定约束）；配置空策略 `[]` 则显式放行全部脚本组合。脚本对在存储与传输中统一规范化为按字典序排列的无序对，PUT 输入顺序无关、重复对去重。
-4. **批量注册**：先把整批与库内已有名称及有效预占联合分析（混脚本按所属空间策略）——每项复用上述单条规则，再对批内两两做规范名相等 / 同形判定，命中时按原请求索引互相标注在双方的 `batch_conflicts` 中。任一项存在混脚本或（库内 / 预占 / 批内）冲突即整体返回 `422` 并汇总所有问题项，不写入任何记录；全部通过时在**单个 SQLite 事务**（`BEGIN IMMEDIATE`）中重新加载空间策略复查混脚本、复查冲突后批量落库，并发竞争（含策略被并发改严）导致判定失效时整批回滚、重新分析并返回 `409` 明细（脚本违规项的 `error` 为 `mixed_script_violation`）。
-5. **预占与确认**：预占复用规范化、混脚本（所属空间策略）与同形判定，先做只读分析，再在 `BEGIN IMMEDIATE` 事务中惰性清理过期预占、重新加载策略复查混脚本与冲突，通过后写入 `name_reservations`（`token = secrets.token_urlsafe(32)`，不可猜测；`expires_at` 为 UTC ISO 8601）。确认时在**单个 `BEGIN IMMEDIATE` 事务**中按序校验：① token 存在且命名空间匹配（否则 `404`）→ ② `expires_at` 未过（过期则删除该记录并提交，返回 `410`）→ ③ `consumed_at IS NULL`（否则 `409`）→ ④ 复查当前冲突，排除自身预占（否则 `409`，不写入）；全部通过后写入 `display_names` 并以条件 `UPDATE ... WHERE consumed_at IS NULL` 回写消费时间，影响行数为 0 即说明并发确认抢先、整事务回滚。因此同一 token 的并发或重复确认至多一次成功。过期记录不在后台定时清理，而是在后续预占 / 注册 / 批量 / 确认 / 策略 PUT 事务中惰性删除。
-6. **命名空间合并**：`POST /namespaces/{source}/merge` 在**单个 `BEGIN IMMEDIATE` 写锁事务**中完成全部工作：先惰性清理两侧过期预占，再对源与目标的**已注册名称及有效预占**做跨空间规范名相等 / 同形复查（同一命名空间内部在写入时已保证互不冲突，只查跨空间组合），并**以目标命名空间的混脚本策略扫描源、目标两侧数据**（目标侧在“策略生效后现存数据始终合规”的不变量下实际不会有违规，但仍显式扫描；源侧记录此前只受源空间策略约束，是主要拒绝来源）。任一冲突即回滚并返回 `409`：规范名 / 同形问题放在 `conflicts`（每项带双方记录 `source_record` / `target_record`，`kind` 为 `registered` 或 `reservation`，预占附 `expires_at`），脚本违规放在 `script_violations`（每项带 `side` 为 `source` / `target`、`record` 与 `violating_script_pairs` / `script_details`），两类问题可同时出现，不修改任何数据；无冲突且两侧数据均合规才在同一事务内把源空间的 `display_names` 与 `name_reservations`（含已消费的历史预占）整体 `UPDATE` 到目标空间，返回 `merged_names` / `merged_reservations` 两个迁移数量。并发写入导致复查或 `(namespace, normalized_name)` 唯一约束失败时整体回滚，由接口层重新检测（冲突与脚本违规都重查）后返回 `409`。目标与源相同 → `422`；源空间不存在或为空时合并为无操作，返回两个 `0`。
-7. **原子改名（乐观锁）**：每条 `display_names` 记录带单调递增的 `revision`（注册时为 1）。`PATCH /namespaces/{namespace}/names/{id}` 请求体为 `{"name": ..., "expected_revision": ...}`，在**单个 `BEGIN IMMEDIATE` 写锁事务**中按序校验：① `id` 存在且属于 URL 中的命名空间（否则 `404 name_not_found`）→ ② 当前 `revision` 等于 `expected_revision`（否则 `409 stale_revision`，附 `current_revision`）→ ③ 新名称不违反所属空间当前混脚本策略（在事务内重新加载策略，否则 `422`）→ ④ 惰性清理过期预占后复查新规范名与**其他已注册名称（显式排除当前记录自身，故改成与自身相等的名称是允许的）及全部有效预占**的规范名相等 / 同形冲突（否则 `409 name_conflict`，明细结构与注册完全一致）。全部通过才在同一事务 `UPDATE original_name / normalized_name` 并以 `revision = revision + 1` 条件更新（`WHERE id = ? AND namespace = ? AND revision = ?`，影响行数为 0 同样按 `stale_revision` 处理）；`id` 与 `created_at` 永不改变，任何失败都整体回滚。改名释放的旧规范名可被其他记录重新注册，改名占用的新规范名同样阻止后续注册 / 预占 / 合并。
-8. **原子交换（乐观锁）**：`POST /namespaces/{namespace}/names/swap` 请求体为 `{"records": [{"id", "expected_revision"}, {"id", "expected_revision"}]}`（恰好两条且 id 不同，否则 `422`），在**单个 `BEGIN IMMEDIATE` 写锁事务**中按序校验：① 两条记录都存在且属于 URL 中的命名空间（任一缺失 / 跨空间即 `404 name_not_found`，`missing_ids` 列出全部缺失 id）→ ② 双方当前 `revision` 分别等于各自 `expected_revision`（任一过期即 `409 stale_revision`，`records` **同时携带双方**的 expected / current revision，供客户端整体重读后重试）。通过后在同一事务成对互换双方的 `original_name` / `normalized_name`，双方 `revision` 各 + 1，`id` / `created_at` 不变。由于 `(namespace, normalized_name)` 是 SQLite **即时**唯一约束（两条记录的规范名互为对方占用，单条或逐条 UPDATE 会立刻违约——单条多行 `UPDATE ... CASE` 也会在逐行更新时触发约束），实现上先把其中一条更新为随机临时名（`secrets.token_hex(32)`，并复查碰撞）腾出唯一槽位，再三步带 `AND revision = ?` 谓词的条件 UPDATE 完成互换（仅后两步递增 revision）。临时名只存在于未提交事务中：写锁串行化所有写入，其他连接在提交前通过快照隔离读到的始终是交换前状态，故临时名不会暴露、也不会破坏并发请求；交换不改变命名空间内已占用规范名的集合，因此与有效预占天然不产生新冲突。任一步骤失败（含唯一约束兜底 / 锁竞争）都整体回滚，绝不产生部分更新。
-9. **命名空间混脚本策略（script-policy）**：策略存于 `namespace_script_policies` 表（每空间至多一行；`blocked_script_pairs` 以 JSON 保存无序去重的规范脚本对，`revision` 首次配置为 1、每次成功 PUT 递增；未配置空间的逻辑版本视为 0）。`GET /namespaces/{namespace}/script-policy` 返回已配置策略；未配置返回 `404 script_policy_not_found`（此时各写入入口与 `check` 仍按内建默认策略 Latin/Cyrillic/Greek 两两阻断判定）。`PUT` 请求体为 `{"blocked_script_pairs": [[脚本A, 脚本B], ...], "expected_revision": ...}`，Pydantic 在入库前完成校验与规范化：每对必须恰好两个**不同**的合法 Unicode 脚本名（不接受 `Common` / `Inherited` / `Unknown` 与未知脚本名，大小写敏感），至多 500 对；对内部按字典序排列、整体去重，非法即 `422`。服务端在**单个 `BEGIN IMMEDIATE` 写锁事务**中按序：① 先惰性清理该空间过期预占 → ② 版本校验（未配置时当前版本按 0 计；不一致即 `409 stale_revision` 附 `current_revision`）→ ③ 用新策略扫描全部已注册名称与剩余有效预占（按原名逐字符分析，命中任一阻断对即记录），存在违规即 `409 script_policy_conflict` 并整体回滚，`violations` 按已注册名称（id 升序）在前、有效预占（id 升序）在后逐条给出 `kind` / `original_name` / `normalized_name`（预占附 `expires_at`）、`violating_script_pairs` 与 `script_details`；全部通过才首次 `INSERT`（revision=1）或条件 `UPDATE ... AND revision = ?`（revision+1 并刷新 `updated_at`）。该扫描维持核心不变量：**策略生效后，空间内现存名称与有效预占始终合规**。因此注册 / 批量 / 预占 / 改名各自的写锁事务都会**重新加载所属空间策略**再复查一次混脚本（只读分析阶段用当时策略，可能与并发的 PUT 产生竞争）：复查命中时注册 / 预占 / 改名返回 `422 mixed_script_violation`，批量整批回滚并返回 `409`（携带事务内复查命中的违规项）。预占确认（claim）无需复查——它只是把已合规的有效预占转成已注册名称（策略 PUT 扫描会先挡住违规预占的产生）；交换（swap）不引入新名称，也无需复查。脚本名合法集合取 `unicodedataplus`（Unicode 16.0）实际枚举到的 `Script` 属性值全集。
+4. **批量注册**：先把整批与库内已有名称、有效预占及未过期冷却联合分析（混脚本按所属空间策略）——每项复用上述单条规则，再对批内两两做规范名相等 / 同形判定，命中时按原请求索引互相标注在双方的 `batch_conflicts` 中。任一项存在混脚本或（库内 / 预占 / 冷却 / 批内）冲突即整体返回 `422` 并汇总所有问题项，不写入任何记录；全部通过时在**单个 SQLite 事务**（`BEGIN IMMEDIATE`，事务开始时先惰性清理过期预占与冷却）中重新加载空间策略复查混脚本、复查冲突后批量落库，并发竞争（含策略被并发改严）导致判定失效时整批回滚、重新分析并返回 `409` 明细（脚本违规项的 `error` 为 `mixed_script_violation`）。
+5. **预占与确认**：预占复用规范化、混脚本（所属空间策略）与同形判定，先做只读分析，再在 `BEGIN IMMEDIATE` 事务中惰性清理过期预占与冷却、重新加载策略复查混脚本与冲突（冲突覆盖有效冷却），通过后写入 `name_reservations`（`token = secrets.token_urlsafe(32)`，不可猜测；`expires_at` 为 UTC ISO 8601）。确认时在**单个 `BEGIN IMMEDIATE` 事务**中按序校验：① token 存在且命名空间匹配（否则 `404`）→ ② `expires_at` 未过（过期则删除该记录并提交，返回 `410`）→ ③ `consumed_at IS NULL`（否则 `409`）→ ④ 惰性清理过期冷却后复查当前冲突（覆盖其他预占与有效冷却，排除自身预占；否则 `409`，不写入）；全部通过后写入 `display_names` 并以条件 `UPDATE ... WHERE consumed_at IS NULL` 回写消费时间，影响行数为 0 即说明并发确认抢先、整事务回滚。因此同一 token 的并发或重复确认至多一次成功。过期记录不在后台定时清理，而是在后续预占 / 注册 / 批量 / 确认 / 改名 / 交换 / 释放 / 合并 / 策略 PUT 等写事务中惰性删除。
+6. **命名空间合并**：`POST /namespaces/{source}/merge` 在**单个 `BEGIN IMMEDIATE` 写锁事务**中完成全部工作：先惰性清理两侧过期预占与冷却，再对源与目标的**已注册名称、有效预占及未过期冷却**做跨空间规范名相等 / 同形复查（同一命名空间内部在写入时已保证互不冲突，只查跨空间组合），并**以目标命名空间的混脚本策略扫描源、目标两侧数据**（目标侧在“策略生效后现存数据始终合规”的不变量下实际不会有违规，但仍显式扫描；源侧记录此前只受源空间策略约束，是主要拒绝来源）。任一冲突即回滚并返回 `409`：规范名 / 同形问题放在 `conflicts`（每项带双方记录 `source_record` / `target_record`，`kind` 为 `registered` / `reservation` / `released`，后两者附 `expires_at`），脚本违规放在 `script_violations`（每项带 `side` 为 `source` / `target`、`record` 与 `violating_script_pairs` / `script_details`），两类问题可同时出现，不修改任何数据；无冲突且两侧数据均合规才在同一事务内把源空间的 `display_names` 与 `name_reservations`（含已消费的历史预占）整体 `UPDATE` 到目标空间（有效冷却记录一并迁移，id / expires_at 原样保留），返回 `merged_names` / `merged_reservations` / `merged_cooldowns` 三个迁移数量。并发写入导致复查或 `(namespace, normalized_name)` 唯一约束失败时整体回滚，由接口层重新检测（冲突与脚本违规都重查）后返回 `409`。目标与源相同 → `422`；源空间不存在或为空时合并为无操作，返回三个 `0`。
+7. **原子改名（乐观锁）**：每条 `display_names` 记录带单调递增的 `revision`（注册时为 1）。`PATCH /namespaces/{namespace}/names/{id}` 请求体为 `{"name": ..., "expected_revision": ...}`，在**单个 `BEGIN IMMEDIATE` 写锁事务**中按序校验：① `id` 存在且属于 URL 中的命名空间（否则 `404 name_not_found`）→ ② 当前 `revision` 等于 `expected_revision`（否则 `409 stale_revision`，附 `current_revision`）→ ③ 新名称不违反所属空间当前混脚本策略（在事务内重新加载策略，否则 `422`）→ ④ 惰性清理过期预占与冷却后复查新规范名与**其他已注册名称（显式排除当前记录自身，故改成与自身相等的名称是允许的）、全部有效预占及未过期冷却**的规范名相等 / 同形冲突（否则 `409 name_conflict`，明细结构与注册完全一致）。全部通过才在同一事务 `UPDATE original_name / normalized_name` 并以 `revision = revision + 1` 条件更新（`WHERE id = ? AND namespace = ? AND revision = ?`，影响行数为 0 同样按 `stale_revision` 处理）；`id` 与 `created_at` 永不改变，任何失败都整体回滚。改名释放的旧规范名可被其他记录重新注册（除非该规范名仍处于释放冷却中），改名占用的新规范名同样阻止后续注册 / 预占 / 合并。
+8. **原子交换（乐观锁）**：`POST /namespaces/{namespace}/names/swap` 请求体为 `{"records": [{"id", "expected_revision"}, {"id", "expected_revision"}]}`（恰好两条且 id 不同，否则 `422`），在**单个 `BEGIN IMMEDIATE` 写锁事务**中按序校验：事务开始先惰性清理过期预占与冷却（交换不改变占用规范名集合，无需冲突复查），① 两条记录都存在且属于 URL 中的命名空间（任一缺失 / 跨空间即 `404 name_not_found`，`missing_ids` 列出全部缺失 id）→ ② 双方当前 `revision` 分别等于各自 `expected_revision`（任一过期即 `409 stale_revision`，`records` **同时携带双方**的 expected / current revision，供客户端整体重读后重试）。通过后在同一事务成对互换双方的 `original_name` / `normalized_name`，双方 `revision` 各 + 1，`id` / `created_at` 不变。由于 `(namespace, normalized_name)` 是 SQLite **即时**唯一约束（两条记录的规范名互为对方占用，单条或逐条 UPDATE 会立刻违约——单条多行 `UPDATE ... CASE` 也会在逐行更新时触发约束），实现上先把其中一条更新为随机临时名（`secrets.token_hex(32)`，并复查碰撞）腾出唯一槽位，再三步带 `AND revision = ?` 谓词的条件 UPDATE 完成互换（仅后两步递增 revision）。临时名只存在于未提交事务中：写锁串行化所有写入，其他连接在提交前通过快照隔离读到的始终是交换前状态，故临时名不会暴露、也不会破坏并发请求；交换不改变命名空间内已占用规范名的集合，因此与有效预占天然不产生新冲突。任一步骤失败（含唯一约束兜底 / 锁竞争）都整体回滚，绝不产生部分更新。
+9. **命名空间混脚本策略（script-policy）**：策略存于 `namespace_script_policies` 表（每空间至多一行；`blocked_script_pairs` 以 JSON 保存无序去重的规范脚本对，`revision` 首次配置为 1、每次成功 PUT 递增；未配置空间的逻辑版本视为 0）。`GET /namespaces/{namespace}/script-policy` 返回已配置策略；未配置返回 `404 script_policy_not_found`（此时各写入入口与 `check` 仍按内建默认策略 Latin/Cyrillic/Greek 两两阻断判定）。`PUT` 请求体为 `{"blocked_script_pairs": [[脚本A, 脚本B], ...], "expected_revision": ...}`，Pydantic 在入库前完成校验与规范化：每对必须恰好两个**不同**的合法 Unicode 脚本名（不接受 `Common` / `Inherited` / `Unknown` 与未知脚本名，大小写敏感），至多 500 对；对内部按字典序排列、整体去重，非法即 `422`。服务端在**单个 `BEGIN IMMEDIATE` 写锁事务**中按序：① 先惰性清理该空间过期预占与冷却 → ② 版本校验（未配置时当前版本按 0 计；不一致即 `409 stale_revision` 附 `current_revision`）→ ③ 用新策略扫描全部已注册名称、剩余有效预占与未过期冷却（按原名逐字符分析，命中任一阻断对即记录），存在违规即 `409 script_policy_conflict` 并整体回滚，`violations` 按已注册名称（id 升序）在前、有效预占（id 升序）居中、未过期冷却（id 升序）在后逐条给出 `kind` / `original_name` / `normalized_name`（预占与冷却附 `expires_at`）、`violating_script_pairs` 与 `script_details`；全部通过才首次 `INSERT`（revision=1）或条件 `UPDATE ... AND revision = ?`（revision+1 并刷新 `updated_at`）。该扫描维持核心不变量：**策略生效后，空间内现存名称、有效预占与未过期冷却始终合规**。因此注册 / 批量 / 预占 / 改名各自的写锁事务都会**重新加载所属空间策略**再复查一次混脚本（只读分析阶段用当时策略，可能与并发的 PUT 产生竞争）：复查命中时注册 / 预占 / 改名返回 `422 mixed_script_violation`，批量整批回滚并返回 `409`（携带事务内复查命中的违规项）。预占确认（claim）无需复查混脚本——它只是把已合规的有效预占转成已注册名称（策略 PUT 扫描会先挡住违规预占的产生），但仍复查与冷却记录的规范名 / 同形冲突；交换（swap）不引入新名称，无需混脚本复查。脚本名合法集合取 `unicodedataplus`（Unicode 16.0）实际枚举到的 `Script` 属性值全集。
+10. **名称释放冷却（DELETE）**：`DELETE /namespaces/{namespace}/names/{id}` 请求体为 `{"expected_revision": ..., "cooldown_seconds": 60–86400}`（边界由 Pydantic 强制：<60 或 >86400 即 `422`，`expected_revision` 必须 ≥1），在**单个 `BEGIN IMMEDIATE` 写锁事务**中按序校验：① `id` 存在且属于 URL 中的命名空间（否则 `404 name_not_found`）→ ② 当前 `revision` 等于 `expected_revision`（否则 `409 stale_revision` 附 `current_revision`）。通过后在同一事务以条件 `DELETE ... WHERE id = ? AND namespace = ? AND revision = ?` 删除已注册名称（影响行数不为 1 同样按 stale 处理），并随即向 `name_cooldowns` 插入一条记录（`original_name` / `normalized_name` 原样保留，`expires_at = now + cooldown_seconds`，UTC ISO 8601），任一步失败整体回滚——绝不会出现“名称已删除但没有冷却占位”的部分更新。冷却记录自提交起与已注册名称、有效预占**完全等价**：注册 / 批量 / 预占 / 确认 / 改名 / `check` 的 `find_conflicts` 按已注册（id 升序）→ 有效预占（id 升序）→ 未过期冷却（id 升序）的顺序输出，冲突明细 `source="released"` 并附 `expires_at`；合并时冷却参与跨空间复查（`kind="released"`）、参与目标策略脚本扫描，并随名称、预占一起 `UPDATE` 迁移到目标空间（响应新增 `merged_cooldowns`）；策略 PUT 的影响面扫描同样覆盖冷却（违规明细 `kind="released"`）。改名 / 交换等只操作 `display_names` 的事务不涉及冷却记录本身。过期冷却（`expires_at <= now`）不参与任何只读判定，也没有后台任务：每个写事务（注册 / 批量 / 预占 / 确认 / 改名 / 交换 / 释放 / 合并 / 策略 PUT）在持写锁后先调用与预占同构的惰性清理按 id 物理删除过期冷却（合并清理两侧、其余清理所属空间）；只读的 `check` 与 `GET .../cooldowns` 在 Python 侧按 `expires_at` 字符串比较过滤过期记录但不删除。`GET /namespaces/{namespace}/cooldowns` 返回该空间全部未过期冷却记录（`SELECT *` 后 Python 侧过滤，按 id 升序），空间不存在或无记录时返回 `[]`。
 
 ## 运行测试
 
@@ -432,9 +489,9 @@ pytest
 ```
 app/
   main.py       # FastAPI 路由与错误响应（200/201/409/422/410/404）
-  service.py    # 注册/改名/交换/批量/预占/确认/合并/策略业务逻辑，逐条冲突判定与事务控制
+  service.py    # 注册/改名/交换/释放冷却/批量/预占/确认/合并/策略业务逻辑，逐条冲突判定与事务控制
   analysis.py   # NFKC+casefold 规范化、脚本与码点分析、脚本对规范化与校验
-  database.py   # SQLite 连接、建表（含 namespace_script_policies）与幂等列迁移（revision）；python -m app.database 可独立初始化
+  database.py   # SQLite 连接、建表（含 namespace_script_policies 与 name_cooldowns）与幂等列迁移（revision）；python -m app.database 可独立初始化
   schemas.py    # Pydantic 请求/响应模型（含策略对无序去重规范化）
 tests/test_api.py
 Dockerfile  docker-compose.yml  scripts/setup.sh
@@ -446,3 +503,4 @@ requirements.txt  requirements-dev.txt
 - `display_names`：已注册名称，`(namespace, normalized_name)` 唯一约束兜底并发；`revision` 为乐观锁版本（初始 1，每次原子改名递增）。老版本数据库缺少该列时，应用启动以幂等的 `ALTER TABLE ADD COLUMN ... DEFAULT 1` 自动补齐。
 - `name_reservations`：预占记录（`token` 唯一、`expires_at`、`consumed_at`）；仅未消费且未过期的行参与冲突判定与策略影响面扫描，过期行惰性物理删除。
 - `namespace_script_policies`：命名空间混脚本策略（每空间至多一行），`blocked_script_pairs` 为 JSON 文本保存的无序去重规范脚本对，`revision` 首次配置为 1、每次成功 PUT 递增；未配置的空间不设行（逻辑版本 0），写入与 `check` 按内建默认策略判定。
+- `name_cooldowns`：名称释放冷却记录（DELETE 时与名称删除在同一事务写入），保存 `original_name` / `normalized_name` / `cooldown_seconds` / `expires_at`；仅未过期行参与冲突判定、合并迁移与策略影响面扫描，过期行在后续写事务中惰性物理删除。表由启动建表幂等创建（`CREATE TABLE IF NOT EXISTS`），老版本数据库升级后自动获得，无列级迁移。

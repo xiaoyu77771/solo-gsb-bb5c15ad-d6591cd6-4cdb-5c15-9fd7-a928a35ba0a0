@@ -5,6 +5,8 @@
 - POST   /namespaces/{namespace}/names/batch                        批量注册（201 / 409 / 422，单事务）
 - POST   /namespaces/{namespace}/names/swap                         原子交换两条已注册名称（200 / 404 / 409 / 422，单事务）
 - PATCH  /namespaces/{namespace}/names/{id}                         原子改名（200 / 404 / 409 / 422，单事务）
+- DELETE /namespaces/{namespace}/names/{id}                         删除名称并进入释放冷却（200 / 404 / 409 / 422，单事务）
+- GET    /namespaces/{namespace}/cooldowns                          列出命名空间内有效释放冷却记录
 - POST   /namespaces/{namespace}/reservations                       预占名称（201 / 409 / 422）
 - POST   /namespaces/{namespace}/reservations/{token}/claim         确认预占并注册（201 / 404 / 409 / 410）
 - POST   /namespaces/{source}/merge                                 合并命名空间（200 / 409 / 422，单事务）
@@ -29,10 +31,12 @@ from .schemas import (
     BatchNameRequest,
     BatchRegisterResponse,
     ClaimedNameRecord,
+    CooldownRecord,
     MergeRequest,
     MergeResult,
     NameRecord,
     NameRequest,
+    ReleaseRequest,
     RenameRequest,
     ReservationRecord,
     ReservationRequest,
@@ -52,18 +56,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unicode Display Name Anti-Spoofing API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "命名空间内的显示名防仿冒：NFKC+casefold 规范名查重、"
         "confusables 同形字符判定；混脚本拦截支持命名空间级策略"
         "（PUT/GET script-policy，未配置时默认 Latin/Cyrillic/Greek "
         "任意两种混用即违规）；支持预占后确认注册（reservations / claim），"
         "未过期预占与已注册名称一样参与全部冲突判定；支持把源命名空间的"
-        "名称与预占记录整体合并到目标命名空间（merge，以目标策略检查两侧"
-        "数据，冲突或违规时不修改任何数据）；支持凭 expected_revision 对"
+        "名称、预占与释放冷却记录整体合并到目标命名空间（merge，以目标策略"
+        "检查两侧数据，冲突或违规时不修改任何数据）；支持凭 expected_revision 对"
         "已注册名称做原子改名（PATCH），改名在单个写锁事务内完成版本校验"
         "与冲突复查；支持同命名空间内两条已注册名称的原子交换（names/swap），"
-        "单事务内校验双方归属与版本后成对互换名称并各递增 revision。"
+        "单事务内校验双方归属与版本后成对互换名称并各递增 revision；"
+        "支持删除名称并设置释放冷却（DELETE）：单事务内校验归属与版本后删除"
+        "名称并生成带 expires_at 的冷却记录，冷却到期前与已注册名称、有效预占"
+        "同等参与全部规范名、同形与混脚本判定（冲突明细 source=released）。"
     ),
     lifespan=lifespan,
 )
@@ -106,7 +113,7 @@ def _conflict_error(normalized_name: str, conflicts: list[dict], message: str) -
     )
 
 
-CONFLICT_MESSAGE = "规范名相同或与命名空间内已有名称（含未过期预占）同形"
+CONFLICT_MESSAGE = "规范名相同或与命名空间内已有名称（含未过期预占/释放冷却）同形"
 
 
 @app.get("/health")
@@ -119,7 +126,7 @@ def health() -> dict:
     status_code=status.HTTP_201_CREATED,
     response_model=NameRecord,
     responses={
-        409: {"description": "规范名相同或与已有名称/有效预占同形（confusable）"},
+        409: {"description": "规范名相同或与已有名称/有效预占/释放冷却同形（confusable）"},
         422: {"description": "混用 Latin/Cyrillic/Greek 中两种及以上脚本"},
     },
 )
@@ -156,7 +163,7 @@ def register_name(namespace: str, payload: NameRequest, conn=Depends(get_db)) ->
     response_model=NameRecord,
     responses={
         404: {"description": "记录不存在，或不属于该命名空间"},
-        409: {"description": "expected_revision 已过期（stale_revision），或新名称与其他记录/有效预占冲突"},
+        409: {"description": "expected_revision 已过期（stale_revision），或新名称与其他记录/有效预占/释放冷却冲突"},
         422: {"description": "混用 Latin/Cyrillic/Greek 中两种及以上脚本"},
     },
 )
@@ -168,8 +175,9 @@ def rename_registered_name(
     事务内按序校验：记录存在且命名空间匹配（否则 404）-> revision 与
     expected_revision 一致（否则 409 stale_revision，附 current_revision）
     -> 新名称不混脚本（否则 422）-> 新规范名与同空间其他已注册名称
-    （排除当前记录）及全部有效预占不冲突（否则 409，沿用注册接口的冲突
-    明细结构）。成功后保留 id / created_at，更新原名与规范名，revision + 1。
+    （排除当前记录）、全部有效预占及未过期释放冷却不冲突（否则 409，沿用
+    注册接口的冲突明细结构）。成功后保留 id / created_at，更新原名与规范
+    名，revision + 1。
     """
     try:
         return service.rename_name(
@@ -201,6 +209,72 @@ def rename_registered_name(
             conn, namespace, normalized_name, exclude_name_id=name_id
         )
         raise _conflict_error(normalized_name, conflicts, CONFLICT_MESSAGE)
+
+
+@app.delete(
+    "/namespaces/{namespace}/names/{name_id}",
+    response_model=CooldownRecord,
+    responses={
+        200: {"description": "名称已删除，返回新生成的释放冷却记录（含 expires_at）"},
+        404: {"description": "记录不存在，或不属于该命名空间"},
+        409: {"description": "expected_revision 已过期（stale_revision，附 current_revision），或锁竞争"},
+        422: {"description": "cooldown_seconds 超出 60–86400 范围，或 expected_revision 非正整数"},
+    },
+)
+def release_registered_name(
+    namespace: str, name_id: int, payload: ReleaseRequest, conn=Depends(get_db)
+) -> dict:
+    """删除已注册名称并设置释放冷却：单个 BEGIN IMMEDIATE 事务内完成。
+
+    事务内按序校验：记录存在且命名空间匹配（否则 404）-> revision 与
+    expected_revision 一致（否则 409 stale_revision，附 current_revision）。
+    通过后在同一事务内删除 display_names 行并写入一条带 expires_at 的
+    name_cooldowns 记录（冷却时长 cooldown_seconds，范围 60–86400 秒）。
+    冷却到期前，该名称的规范名与同形名与已注册名称、有效预占同等参与
+    单条 / 批量注册、预占、改名、check、命名空间合并及脚本策略更新的
+    全部判定，冲突明细以 source="released" 标识；到期记录在后续写操作中
+    惰性清理，之后名称可被重新注册。任何失败都整体回滚，不存在“已删除但
+    无冷却”的部分更新。
+    """
+    try:
+        return service.release_name(
+            conn,
+            namespace,
+            name_id,
+            payload.expected_revision,
+            payload.cooldown_seconds,
+        )
+    except service.NameNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "name_not_found",
+                "message": "已注册名称不存在，或不属于该命名空间",
+            },
+        )
+    except service.StaleRevisionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "stale_revision",
+                "message": "名称记录已被其他请求修改，请重新读取最新版本后重试",
+                "current_revision": exc.current_revision,
+            },
+        )
+    except service.NameConflictError:
+        # 锁竞争兜底：事务已整体回滚（名称仍在、冷却未写），重读版本后重试
+        row = conn.execute(
+            "SELECT revision FROM display_names WHERE id = ? AND namespace = ?",
+            (name_id, namespace),
+        ).fetchone()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "release_conflict",
+                "message": "删除时发生并发竞争，事务已整体回滚（无部分更新），请重试",
+                "current_revision": row["revision"] if row else None,
+            },
+        )
 
 
 @app.post(
@@ -361,7 +435,7 @@ def register_names_batch(
     status_code=status.HTTP_201_CREATED,
     response_model=ReservationRecord,
     responses={
-        409: {"description": "规范名相同或与已有名称/有效预占同形（confusable）"},
+        409: {"description": "规范名相同或与已有名称/有效预占/释放冷却同形（confusable）"},
         422: {"description": "混脚本违规，或 ttl_seconds 超出 30–600 范围"},
     },
 )
@@ -370,8 +444,9 @@ def reserve_name(
 ) -> dict:
     """预占名称：复用规范化 / 混脚本 / 同形判定，返回不可猜测 token。
 
-    未过期、未消费的预占与已注册名称一样阻止后续单条注册、批量注册
-    及新预占；预占记录在确认（claim）后才真正写入 display_names。
+    未过期、未消费的预占与已注册名称一样阻止后续单条注册、批量注册及
+    新预占；判定同时覆盖未过期释放冷却。预占记录在确认（claim）后才
+    真正写入 display_names。
     """
     analysis = service.analyze_name(conn, namespace, payload.name)
 
@@ -406,7 +481,7 @@ def reserve_name(
     response_model=ClaimedNameRecord,
     responses={
         404: {"description": "token 不存在或不属于该命名空间"},
-        409: {"description": "预占已被消费（重复/并发确认），或当前与已有名称/其他有效预占冲突"},
+        409: {"description": "预占已被消费（重复/并发确认），或当前与已有名称/其他有效预占/释放冷却冲突"},
         410: {"description": "预占已过期（记录被惰性清理）"},
     },
 )
@@ -456,7 +531,7 @@ def claim_reservation(namespace: str, token: str, conn=Depends(get_db)) -> dict:
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "error": "name_conflict",
-                "message": "确认时名称与已注册名称或其他有效预占冲突，未写入",
+                "message": "确认时名称与已注册名称、其他有效预占或释放冷却冲突，未写入",
                 "normalized_name": normalized_name,
                 "conflicts": conflicts or [],
             },
@@ -468,18 +543,19 @@ def claim_reservation(namespace: str, token: str, conn=Depends(get_db)) -> dict:
     response_model=MergeResult,
     responses={
         409: {
-            "description": "源与目标存在规范名/同形冲突（含有效预占），或并发写入使合并判定失效；均未修改数据"
+            "description": "源与目标存在规范名/同形冲突（含有效预占与释放冷却），或并发写入使合并判定失效；均未修改数据"
         },
         422: {"description": "目标命名空间空白或与源命名空间相同"},
     },
 )
 def merge_namespace(source: str, payload: MergeRequest, conn=Depends(get_db)) -> dict:
-    """合并命名空间：把 source 的全部已注册名称与预占记录迁入 target。
+    """合并命名空间：把 source 的全部已注册名称、有效预占与释放冷却记录迁入 target。
 
-    在单个 BEGIN IMMEDIATE 写锁事务中，先对两侧的已注册名称与有效预占
-    做跨空间规范名 / 同形复查：任一冲突 -> 409 并返回双方记录，不修改
-    任何数据；无冲突则在同一事务内迁移并返回迁移数量。并发写入导致
-    复查或唯一约束失败时整体回滚，重新检测后返回 409。
+    在单个 BEGIN IMMEDIATE 写锁事务中，先对两侧的已注册名称、有效预占与
+    未过期冷却做跨空间规范名 / 同形复查（过期记录先惰性清理）：任一冲突
+    -> 409 并返回双方记录，不修改任何数据；无冲突则在同一事务内迁移
+    （冷却与名称、预占一起 UPDATE 到目标空间）并返回迁移数量。并发写入
+    导致复查或唯一约束失败时整体回滚，重新检测后返回 409。
     """
     target = payload.target_namespace
     if target == source:
@@ -500,16 +576,16 @@ def merge_namespace(source: str, payload: MergeRequest, conn=Depends(get_db)) ->
             script_violations = exc.script_violations
             if conflicts and script_violations:
                 message = (
-                    "源与目标命名空间存在规范名/同形冲突（含有效预占），"
+                    "源与目标命名空间存在规范名/同形冲突（含有效预占与释放冷却），"
                     "且源/目标数据存在违反目标命名空间混脚本策略的记录，"
                     "未修改任何数据"
                 )
             elif conflicts:
-                message = "源与目标命名空间存在规范名/同形冲突（含有效预占），未修改任何数据"
+                message = "源与目标命名空间存在规范名/同形冲突（含有效预占与释放冷却），未修改任何数据"
             else:
                 message = (
-                    "源/目标命名空间存在违反目标命名空间混脚本策略的已注册名称或"
-                    "有效预占，未修改任何数据"
+                    "源/目标命名空间存在违反目标命名空间混脚本策略的已注册名称、"
+                    "有效预占或释放冷却记录，未修改任何数据"
                 )
         else:
             # 并发写入导致唯一约束/锁失败：已整体回滚，重新检测后返回明细
@@ -534,7 +610,7 @@ def merge_namespace(source: str, payload: MergeRequest, conn=Depends(get_db)) ->
     response_model=AnalysisResult,
 )
 def check_name(namespace: str, payload: NameRequest, conn=Depends(get_db)) -> dict:
-    """只分析不落库：返回规范名、脚本分析与潜在冲突（含未过期预占）。"""
+    """只分析不落库：返回规范名、脚本分析与潜在冲突（含未过期预占与释放冷却）。"""
     return service.analyze_name(conn, namespace, payload.name)
 
 
@@ -544,6 +620,15 @@ def check_name(namespace: str, payload: NameRequest, conn=Depends(get_db)) -> di
 )
 def list_names(namespace: str, conn=Depends(get_db)) -> list[dict]:
     return service.list_names(conn, namespace)
+
+
+@app.get(
+    "/namespaces/{namespace}/cooldowns",
+    response_model=list[CooldownRecord],
+)
+def list_cooldowns(namespace: str, conn=Depends(get_db)) -> list[dict]:
+    """列出命名空间内仍有效的释放冷却记录（过期记录不出现，只读不清理）。"""
+    return service.list_cooldowns(conn, namespace)
 
 
 @app.get(
@@ -583,8 +668,8 @@ def get_script_policy(namespace: str, conn=Depends(get_db)) -> dict:
         409: {
             "description":
                 "expected_revision 已过期（stale_revision，附 current_revision，"
-                "未配置时为 0），或新策略会使现存已注册名称/有效预占违规"
-                "（script_policy_conflict，附逐条违规明细），策略不更新"
+                "未配置时为 0），或新策略会使现存已注册名称/有效预占/释放冷却"
+                "违规（script_policy_conflict，附逐条违规明细），策略不更新"
         },
         422: {"description": "blocked_script_pairs 含未知脚本名 / 同名对 / 项长度不为 2 / 超过上限"},
     },
@@ -598,11 +683,12 @@ def put_script_policy(
     事务内先校验 expected_revision：命名空间未配置时当前版本按 0 计，
     首次配置必须传 0；之后传上次 GET/PUT 返回的 revision，不一致 ->
     409 stale_revision（附 current_revision）。版本通过后，用新策略扫描
-    该空间全部已注册名称与有效预占（过期预占先惰性清理）：任一现存名称
-    命中新策略中的阻断脚本对 -> 409 script_policy_conflict，逐条给出
-    记录（kind 区分 registered/reservation）、命中的脚本对与码点明细，
-    策略不更新。全部通过才写入：首次配置 revision=1，之后每次 PUT 成功
-    revision 递增。配置为空列表表示该空间不再拦截任何混脚本组合。
+    该空间全部已注册名称、有效预占与未过期释放冷却（过期记录先惰性清理）：
+    任一现存名称命中新策略中的阻断脚本对 -> 409 script_policy_conflict，
+    逐条给出记录（kind 区分 registered/reservation/released）、命中的
+    脚本对与码点明细，策略不更新。全部通过才写入：首次配置 revision=1，
+    之后每次 PUT 成功 revision 递增。配置为空列表表示该空间不再拦截任何
+    混脚本组合。
     """
     pairs = [tuple(pair) for pair in payload.blocked_script_pairs]
     try:
@@ -642,8 +728,9 @@ def put_script_policy(
             detail={
                 "error": "script_policy_conflict",
                 "message": (
-                    "新策略会使命名空间内现存的已注册名称或有效预占违规，"
-                    "策略未更新；请先改名 / 等待预占过期后重试"
+                    "新策略会使命名空间内现存的已注册名称、有效预占或释放冷却"
+                    "记录违规，策略未更新；请先改名 / 删除名称 / 等待预占或冷却"
+                    "到期后重试"
                 ),
                 "violations": exc.violations,
             },

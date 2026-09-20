@@ -20,6 +20,12 @@ blocked_script_pairs 以 JSON 文本保存规范对列表（无序、去重、�
 revision 为乐观锁版本号（初始为 1，每次成功 PUT 递增；未配置的命名空间
 逻辑版本视为 0，首次 PUT 必须携带 expected_revision=0）。未配置策略的
 命名空间沿用内建默认策略（Latin/Cyrillic/Greek 任意两种混用即违规）。
+
+name_cooldowns 保存“名称释放冷却”记录：DELETE 已注册名称时在同一事务内
+删除 display_names 行并写入本表，expires_at 为 UTC 冷却到期时刻。未过期的
+冷却记录与 display_names / 有效预占一样参与全部冲突与混脚本判定；到期记录
+在后续写事务中惰性物理删除。建表同样幂等（IF NOT EXISTS），老版本数据库
+启动时自动获得该表，无需手工迁移。
 """
 from __future__ import annotations
 
@@ -64,6 +70,20 @@ CREATE TABLE IF NOT EXISTS namespace_script_policies (
     created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS name_cooldowns (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace        TEXT NOT NULL,
+    original_name    TEXT NOT NULL,
+    normalized_name  TEXT NOT NULL,
+    cooldown_seconds INTEGER NOT NULL,
+    expires_at       TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 冲突检测的热路径：按命名空间取冷却记录，再按 expires_at 过滤
+CREATE INDEX IF NOT EXISTS idx_name_cooldowns_namespace
+    ON name_cooldowns (namespace, expires_at);
 """
 
 

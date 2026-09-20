@@ -101,6 +101,33 @@ class ReservationRequest(BaseModel):
     )
 
 
+# 释放冷却时长边界（与 cooldown_seconds 的接口约束保持一致）
+MIN_COOLDOWN_SECONDS = 60
+MAX_COOLDOWN_SECONDS = 86400
+
+
+class ReleaseRequest(BaseModel):
+    """删除（释放）已注册名称请求体：乐观锁版本 + 冷却时长（60–86400 秒）。"""
+
+    expected_revision: int = Field(
+        ge=1,
+        examples=[1],
+        description=(
+            "调用方上次读取到的 revision；与当前值一致才执行删除，"
+            "删除与冷却记录写入在同一个事务内完成"
+        ),
+    )
+    cooldown_seconds: int = Field(
+        ge=MIN_COOLDOWN_SECONDS,
+        le=MAX_COOLDOWN_SECONDS,
+        examples=[3600],
+        description=(
+            "释放冷却时长（秒），范围 60–86400；冷却到期前该名称的规范名"
+            "与同形名仍阻止注册 / 预占 / 改名 / 合并"
+        ),
+    )
+
+
 class ScriptDetail(BaseModel):
     script: str
     characters: list[str]
@@ -158,9 +185,9 @@ class ConflictRecord(BaseModel):
     original_name: str
     normalized_name: str
     reason: Literal["normalized_match", "confusable"]
-    # 冲突来源：已注册名称（默认，向后兼容）或仍有效的预占
-    source: Literal["registered", "reservation"] = "registered"
-    # 仅 source == "reservation" 时出现：预占过期时刻（UTC ISO 8601）
+    # 冲突来源：已注册名称（默认，向后兼容）、仍有效的预占，或释放冷却记录
+    source: Literal["registered", "reservation", "released"] = "registered"
+    # 仅 source 为 reservation / released 时出现：有效期 / 冷却到期时刻
     expires_at: str | None = None
 
 
@@ -213,6 +240,18 @@ class ClaimedNameRecord(NameRecord):
     consumed_at: str
 
 
+class CooldownRecord(BaseModel):
+    """释放冷却记录：DELETE 成功响应，也是冷却列表接口的列表项。"""
+
+    id: int
+    namespace: str
+    original_name: str
+    normalized_name: str
+    cooldown_seconds: int = Field(description="本次释放设置的冷却时长（秒）")
+    expires_at: str = Field(description="冷却到期时刻（UTC ISO 8601）；到期前同名 / 同形名仍被拦截")
+    created_at: str
+
+
 class BatchItemRecord(NameRecord):
     """批量注册成功的单项记录：落库字段 + 原请求索引。"""
 
@@ -261,6 +300,9 @@ class MergeResult(BaseModel):
     merged_names: int = Field(description="迁移的已注册名称数量")
     merged_reservations: int = Field(
         description="迁移的预占记录数量（含已消费的历史记录；过期记录已惰性清理，不迁移）"
+    )
+    merged_cooldowns: int = Field(
+        description="迁移的有效释放冷却记录数量（过期冷却已惰性清理，不迁移）"
     )
 
 

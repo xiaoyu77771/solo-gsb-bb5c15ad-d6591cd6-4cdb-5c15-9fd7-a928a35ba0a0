@@ -75,6 +75,17 @@
 4. 合并（merge）以目标命名空间的策略检查源、目标两侧的已注册名称与有效
    预占；目标侧数据在不变量下必然合规（实际违规集为空，但仍按要求扫描），
    源侧任一记录违规即随跨空间冲突一起 409 且不迁移任何数据
+
+名称释放冷却（name_cooldowns，DELETE 接口）：
+1. DELETE /namespaces/{namespace}/names/{id} 携带 expected_revision 与
+   cooldown_seconds（60–86400），在单个 BEGIN IMMEDIATE 事务内校验归属与
+   版本，通过后删除 display_names 行并写入一条带 expires_at 的冷却记录
+2. 未过期冷却记录与已注册名称、有效预占完全等价地参与单条 / 批量注册、
+   预占、改名、check 的规范名 / 同形判定（冲突明细 source="released"，
+   附 expires_at），也参与命名空间合并的跨空间复查 / 整体迁移，以及
+   脚本策略 PUT 的影响面扫描（违规明细 kind="released"）
+3. 过期冷却记录不参与任何判定，在每个写事务开始时惰性物理删除；
+   GET /namespaces/{namespace}/cooldowns 只读列出仍有效的冷却记录
 """
 from __future__ import annotations
 
@@ -96,6 +107,7 @@ REASON_CONFUSABLE = "confusable"
 
 SOURCE_REGISTERED = "registered"
 SOURCE_RESERVATION = "reservation"
+SOURCE_RELEASED = "released"
 
 # token 使用 URL 安全随机字节；仅含 A-Za-z0-9_-，可直接放在路径中
 TOKEN_BYTES = 32
@@ -103,6 +115,10 @@ TOKEN_BYTES = 32
 # 预占 TTL 边界（与 schemas.ReservationRequest 的校验保持一致）
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 600
+
+# 释放冷却时长边界（与 schemas.ReleaseRequest 的校验保持一致）
+MIN_COOLDOWN_SECONDS = 60
+MAX_COOLDOWN_SECONDS = 86400
 
 
 class NameConflictError(Exception):
@@ -289,7 +305,8 @@ def _script_violation_entry(row, kind: str, pairs) -> dict | None:
     """按策略 pairs 分析单条记录的原名；违规则返回明细，否则 None。
 
     row 需含 id / original_name / normalized_name；kind 区分已注册名称
-    （registered）与有效预占（reservation，附 expires_at）。
+    （registered）、有效预占（reservation）与未过期释放冷却（released），
+    后两者附 expires_at。
     """
     analysis = analyze_scripts(row["original_name"], pairs)
     if not analysis["mixed_script_violation"]:
@@ -302,7 +319,7 @@ def _script_violation_entry(row, kind: str, pairs) -> dict | None:
         "violating_script_pairs": analysis["violating_script_pairs"],
         "script_details": analysis["script_details"],
     }
-    if kind == SOURCE_RESERVATION:
+    if kind in (SOURCE_RESERVATION, SOURCE_RELEASED):
         entry["expires_at"] = row["expires_at"]
     return entry
 
@@ -313,10 +330,11 @@ def find_script_violations(
     pairs,
     now: datetime | None = None,
 ) -> list[dict]:
-    """扫描命名空间内违反给定脚本策略的已注册名称与有效预占。
+    """扫描命名空间内违反给定脚本策略的已注册名称、有效预占与冷却记录。
 
-    已注册名称按 id 排序在前，有效预占按 id 排序在后；过期 / 已消费预占
-    不参与（调用方一般已在写事务内完成惰性清理）。
+    已注册名称按 id 排序在前，有效预占按 id 排序居中，未过期冷却按 id
+    排序在后；过期 / 已消费预占与过期冷却不参与（调用方一般已在写事务内
+    完成惰性清理）。
     """
     moment = now or utc_now()
     violations: list[dict] = []
@@ -334,6 +352,10 @@ def find_script_violations(
             violations.append(entry)
     for row in _active_reservation_rows(conn, namespace, moment):
         entry = _script_violation_entry(row, SOURCE_RESERVATION, pairs)
+        if entry is not None:
+            violations.append(entry)
+    for row in _active_cooldown_rows(conn, namespace, moment):
+        entry = _script_violation_entry(row, SOURCE_RELEASED, pairs)
         if entry is not None:
             violations.append(entry)
     return violations
@@ -378,8 +400,9 @@ def put_script_policy(
     )
     try:
         conn.execute("BEGIN IMMEDIATE")
-        # 持锁期间惰性清理过期预占，保证影响面扫描只含有效预占
+        # 持锁期间惰性清理过期预占与冷却，保证影响面扫描只含有效记录
         purge_expired_reservations(conn, namespace)
+        purge_expired_cooldowns(conn, namespace)
 
         row = conn.execute(
             "SELECT revision FROM namespace_script_policies WHERE namespace = ?",
@@ -451,7 +474,7 @@ def _conflict_entry(row, source: str, reason: str) -> dict:
         "reason": reason,
         "source": source,
     }
-    if source == SOURCE_RESERVATION:
+    if source in (SOURCE_RESERVATION, SOURCE_RELEASED):
         entry["expires_at"] = row["expires_at"]
     return entry
 
@@ -471,6 +494,27 @@ def _active_reservation_rows(
         SELECT id, original_name, normalized_name, expires_at
         FROM name_reservations
         WHERE namespace = ? AND consumed_at IS NULL
+        ORDER BY id
+        """,
+        (namespace,),
+    ).fetchall()
+    return [
+        row
+        for row in rows
+        if parse_expires_at(row["expires_at"]) > moment
+    ]
+
+
+def _active_cooldown_rows(
+    conn: sqlite3.Connection, namespace: str, now: datetime | None = None
+) -> list[sqlite3.Row]:
+    """读取释放冷却记录并在 Python 侧剔除已过期记录（与预占同构）。"""
+    moment = now or utc_now()
+    rows = conn.execute(
+        """
+        SELECT id, original_name, normalized_name, expires_at
+        FROM name_cooldowns
+        WHERE namespace = ?
         ORDER BY id
         """,
         (namespace,),
@@ -514,6 +558,32 @@ def purge_expired_reservations(
         )
 
 
+def purge_expired_cooldowns(
+    conn: sqlite3.Connection, namespace: str | None = None, now: datetime | None = None
+) -> None:
+    """惰性清理：删除已过期的释放冷却记录（必须在写锁事务中调用）。
+
+    与 purge_expired_reservations 同构；namespace 为 None 时清理所有命名空间。
+    """
+    moment = now or utc_now()
+    sql = "SELECT id, expires_at FROM name_cooldowns"
+    params: tuple = ()
+    if namespace is not None:
+        sql += " WHERE namespace = ?"
+        params = (namespace,)
+    rows = conn.execute(sql, params).fetchall()
+    expired_ids = [
+        row["id"]
+        for row in rows
+        if parse_expires_at(row["expires_at"]) <= moment
+    ]
+    if expired_ids:
+        conn.executemany(
+            "DELETE FROM name_cooldowns WHERE id = ?",
+            [(id_,) for id_ in expired_ids],
+        )
+
+
 def find_conflicts(
     conn: sqlite3.Connection,
     namespace: str,
@@ -522,12 +592,13 @@ def find_conflicts(
     exclude_name_id: int | None = None,
     now: datetime | None = None,
 ) -> list[dict]:
-    """与同命名空间内已注册名称及有效预占逐条做规范名相等 / 同形判定。
+    """与同命名空间内已注册名称、有效预占及未过期冷却逐条做规范名/同形判定。
 
-    已注册名称冲突排在前（按 id），有效预占冲突排在后（按 id）。
+    已注册名称冲突排在前（按 id），有效预占冲突居中（按 id），未过期冷却
+    冲突排在后（按 id）。
     exclude_reservation_id：确认注册时排除正在确认的那条预占自身。
     exclude_name_id：改名时排除正在改名的那条已注册记录自身（新规范名
-    与自身相等不算冲突）；有效预占不排除，仍全部参与判定。
+    与自身相等不算冲突）；有效预占与冷却不排除，仍全部参与判定。
     """
     conflicts: list[dict] = []
     rows = conn.execute(
@@ -562,14 +633,25 @@ def find_conflicts(
         else:
             continue
         conflicts.append(_conflict_entry(row, SOURCE_RESERVATION, reason))
+
+    for row in _active_cooldown_rows(conn, namespace, now):
+        existing_normalized = row["normalized_name"]
+        if existing_normalized == normalized_name:
+            reason = REASON_NORMALIZED_MATCH
+        elif is_confusable(normalized_name, existing_normalized):
+            reason = REASON_CONFUSABLE
+        else:
+            continue
+        conflicts.append(_conflict_entry(row, SOURCE_RELEASED, reason))
     return conflicts
 
 
 def analyze_name(conn: sqlite3.Connection, namespace: str, name: str) -> dict:
     """完整分析：规范名 + 脚本分析 + 冲突检测（只读，不落库）。
 
-    冲突同时覆盖已注册名称与未过期预占；过期预占不参与，也不会在此被删除。
-    混脚本按所属命名空间的生效策略判定（未配置时使用内建默认策略）。
+    冲突同时覆盖已注册名称、未过期预占与未过期释放冷却；过期记录不参与，
+    也不会在此被删除（只读路径不做惰性清理）。混脚本按所属命名空间的
+    生效策略判定（未配置时使用内建默认策略）。
     """
     normalized = normalize_name(name)
     pairs = get_blocked_pairs(conn, namespace)
@@ -654,6 +736,7 @@ def register_name(
     try:
         conn.execute("BEGIN IMMEDIATE")
         purge_expired_reservations(conn, namespace)
+        purge_expired_cooldowns(conn, namespace)
         script_analysis = analyze_scripts(name, get_blocked_pairs(conn, namespace))
         if script_analysis["mixed_script_violation"]:
             raise MixedScriptNameError(script_analysis)
@@ -728,10 +811,11 @@ def rename_name(
         if script_analysis["mixed_script_violation"]:
             raise MixedScriptNameError(script_analysis)
 
-        # 持锁期间惰性清理过期预占，使冲突判定只含有效预占
+        # 持锁期间惰性清理过期预占与冷却，使冲突判定只含有效记录
         purge_expired_reservations(conn, namespace)
+        purge_expired_cooldowns(conn, namespace)
 
-        # 4. 事务内复查冲突：排除当前记录自身，有效预占仍全部参与
+        # 4. 事务内复查冲突：排除当前记录自身，有效预占与冷却仍全部参与
         conflicts = find_conflicts(
             conn,
             namespace,
@@ -810,6 +894,9 @@ def swap_names(
     (left_id, left_expected), (right_id, right_expected) = entries
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # 写操作前惰性清理过期预占与冷却（交换不改变占用规范名集合，无需复查）
+        purge_expired_reservations(conn, namespace)
+        purge_expired_cooldowns(conn, namespace)
         rows = {
             row["id"]: row
             for row in conn.execute(
@@ -943,8 +1030,9 @@ def insert_batch(conn: sqlite3.Connection, namespace: str, names: list[str]) -> 
     normalized_names = [normalize_name(name) for name in names]
     try:
         conn.execute("BEGIN IMMEDIATE")
-        # 持锁期间顺带惰性清理过期预占
+        # 持锁期间顺带惰性清理过期预占与冷却
         purge_expired_reservations(conn, namespace)
+        purge_expired_cooldowns(conn, namespace)
         # 事务内复查混脚本：策略可能在批次只读分析后被并发改严
         pairs = get_blocked_pairs(conn, namespace)
         script_violations = []
@@ -1013,6 +1101,7 @@ def create_reservation(
     try:
         conn.execute("BEGIN IMMEDIATE")
         purge_expired_reservations(conn, namespace)
+        purge_expired_cooldowns(conn, namespace)
         script_analysis = analyze_scripts(name, get_blocked_pairs(conn, namespace))
         if script_analysis["mixed_script_violation"]:
             raise MixedScriptNameError(script_analysis)
@@ -1059,6 +1148,9 @@ def claim_reservation(conn: sqlite3.Connection, namespace: str, token: str) -> d
     """
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # 写操作前惰性清理过期冷却（过期预占仅按 token 单独惰性删除，
+        # 避免确认无关空间的预占）
+        purge_expired_cooldowns(conn, namespace)
         row = conn.execute(
             "SELECT * FROM name_reservations WHERE token = ?",
             (token,),
@@ -1132,14 +1224,14 @@ def claim_reservation(conn: sqlite3.Connection, namespace: str, token: str) -> d
 
 
 def _merge_entry(row, kind: str) -> dict:
-    """合并冲突记录：kind 区分已注册名称（registered）与有效预占（reservation）。"""
+    """合并冲突记录：kind 区分已注册名称 / 有效预占 / 未过期冷却。"""
     entry = {
         "id": row["id"],
         "original_name": row["original_name"],
         "normalized_name": row["normalized_name"],
         "kind": kind,
     }
-    if kind == SOURCE_RESERVATION:
+    if kind in (SOURCE_RESERVATION, SOURCE_RELEASED):
         entry["expires_at"] = row["expires_at"]
     return entry
 
@@ -1147,7 +1239,10 @@ def _merge_entry(row, kind: str) -> dict:
 def _namespace_merge_entries(
     conn: sqlite3.Connection, namespace: str, now: datetime | None = None
 ) -> list[dict]:
-    """读取命名空间内参与合并冲突判定的全部记录：已注册名称 + 有效预占。"""
+    """读取命名空间内参与合并冲突判定的全部记录。
+
+    顺序：已注册名称 + 有效预占 + 未过期释放冷却。
+    """
     entries = [
         _merge_entry(row, SOURCE_REGISTERED)
         for row in conn.execute(
@@ -1164,6 +1259,10 @@ def _namespace_merge_entries(
         _merge_entry(row, SOURCE_RESERVATION)
         for row in _active_reservation_rows(conn, namespace, now)
     )
+    entries.extend(
+        _merge_entry(row, SOURCE_RELEASED)
+        for row in _active_cooldown_rows(conn, namespace, now)
+    )
     return entries
 
 
@@ -1175,9 +1274,10 @@ def find_merge_conflicts(
 ) -> list[dict]:
     """源与目标命名空间之间的跨空间冲突检测（规范名相同 / 同形）。
 
-    两侧都覆盖已注册名称与有效预占；同一命名空间内部的记录在写入时已
-    保证互不冲突，只需检查跨空间组合。返回的每项冲突都带双方记录
-    （source_record 来自源命名空间，target_record 来自目标命名空间）。
+    两侧都覆盖已注册名称、有效预占与未过期释放冷却；同一命名空间内部的
+    记录在写入时已保证互不冲突，只需检查跨空间组合。返回的每项冲突都带
+    双方记录（source_record 来自源命名空间，target_record 来自目标命名空间，
+    kind 区分 registered / reservation / released）。
     """
     moment = now or utc_now()
     source_entries = _namespace_merge_entries(conn, source_namespace, moment)
@@ -1204,16 +1304,22 @@ def find_merge_conflicts(
 
 
 def _merge_script_violations(entries: list[dict], pairs, side: str) -> list[dict]:
-    """按目标策略 pairs 检查单侧合并记录（已注册名称 + 有效预占）。
+    """按目标策略 pairs 检查单侧合并记录（已注册名称 + 有效预占 + 冷却）。
 
     每项违规明细额外带 side（"source" / "target"），记录结构与跨空间
-    冲突明细一致（kind 区分 registered / reservation，预占附 expires_at）。
+    冲突明细一致（kind 区分 registered / reservation / released，后两者
+    附 expires_at）。
     """
     violations: list[dict] = []
     for entry in entries:
         analysis = analyze_scripts(entry["original_name"], pairs)
         if not analysis["mixed_script_violation"]:
             continue
+        expires_field = (
+            {"expires_at": entry["expires_at"]}
+            if entry["kind"] in (SOURCE_RESERVATION, SOURCE_RELEASED)
+            else {}
+        )
         violations.append(
             {
                 "side": side,
@@ -1222,11 +1328,7 @@ def _merge_script_violations(entries: list[dict], pairs, side: str) -> list[dict
                     "kind": entry["kind"],
                     "original_name": entry["original_name"],
                     "normalized_name": entry["normalized_name"],
-                    **(
-                        {"expires_at": entry["expires_at"]}
-                        if entry["kind"] == SOURCE_RESERVATION
-                        else {}
-                    ),
+                    **expires_field,
                 },
                 "violating_script_pairs": analysis["violating_script_pairs"],
                 "script_details": analysis["script_details"],
@@ -1259,20 +1361,22 @@ def find_merge_script_violations(
 def merge_namespaces(
     conn: sqlite3.Connection, source_namespace: str, target_namespace: str
 ) -> dict:
-    """把源命名空间的全部已注册名称与预占记录合并到目标命名空间。
+    """把源命名空间的全部已注册名称、预占记录与有效冷却合并到目标命名空间。
 
     调用方需保证 source_namespace != target_namespace。单个 BEGIN IMMEDIATE
-    事务内完成：惰性清理两侧过期预占 -> 跨空间冲突复查（已注册名称 +
-    有效预占）-> 以目标命名空间的混脚本策略扫描源、目标两侧数据 ->
-    无冲突且两侧数据均合规才整体 UPDATE 迁移。复查发现冲突或脚本违规抛
-    MergeConflictError（携带双方记录 / 逐条违规明细），不修改任何数据；
-    唯一约束 / 锁竞争等并发异常同样整体回滚，抛 MergeConflictError（明细
-    为空，由调用方重新检测）。
+    事务内完成：惰性清理两侧过期预占与冷却 -> 跨空间冲突复查（已注册名称 +
+    有效预占 + 未过期冷却）-> 以目标命名空间的混脚本策略扫描源、目标两侧
+    数据 -> 无冲突且两侧数据均合规才整体 UPDATE 迁移。复查发现冲突或脚本
+    违规抛 MergeConflictError（携带双方记录 / 逐条违规明细），不修改任何
+    数据；唯一约束 / 锁竞争等并发异常同样整体回滚，抛 MergeConflictError
+    （明细为空，由调用方重新检测）。
     """
     try:
         conn.execute("BEGIN IMMEDIATE")
         purge_expired_reservations(conn, source_namespace)
         purge_expired_reservations(conn, target_namespace)
+        purge_expired_cooldowns(conn, source_namespace)
+        purge_expired_cooldowns(conn, target_namespace)
         # 事务内复查：持锁期间状态不变，判定结果可信
         conflicts = find_merge_conflicts(conn, source_namespace, target_namespace)
         script_violations = find_merge_script_violations(
@@ -1288,8 +1392,13 @@ def merge_namespaces(
             "UPDATE name_reservations SET namespace = ? WHERE namespace = ?",
             (target_namespace, source_namespace),
         )
+        cooldowns_cursor = conn.execute(
+            "UPDATE name_cooldowns SET namespace = ? WHERE namespace = ?",
+            (target_namespace, source_namespace),
+        )
         merged_names = names_cursor.rowcount
         merged_reservations = reservations_cursor.rowcount
+        merged_cooldowns = cooldowns_cursor.rowcount
         conn.commit()
     except MergeConflictError:
         conn.rollback()
@@ -1304,6 +1413,7 @@ def merge_namespaces(
         "target_namespace": target_namespace,
         "merged_names": merged_names,
         "merged_reservations": merged_reservations,
+        "merged_cooldowns": merged_cooldowns,
     }
 
 
@@ -1313,3 +1423,113 @@ def list_names(conn: sqlite3.Connection, namespace: str) -> list[dict]:
         (namespace,),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def release_name(
+    conn: sqlite3.Connection,
+    namespace: str,
+    name_id: int,
+    expected_revision: int,
+    cooldown_seconds: int,
+) -> dict:
+    """删除已注册名称并写入释放冷却：单个 BEGIN IMMEDIATE 事务内完成。
+
+    事务内校验顺序：
+    1. 记录存在且命名空间匹配，否则 NameNotFoundError -> 404
+    2. revision == expected_revision，否则 StaleRevisionError -> 409
+
+    全部通过后先惰性清理过期冷却，再在同一事务删除 display_names 行并写入
+    name_cooldowns（expires_at = 当前时刻 + cooldown_seconds）。冷却记录
+    即刻占位：提交后该名称的规范名 / 同形名在冷却到期前阻止一切注册、
+    预占、改名与跨空间合并。条件 DELETE（AND revision = ?）兜底并发，
+    影响 0 行按版本过期处理；任何失败均回滚，不存在“名称已删除但无冷却”
+    的部分更新。返回新写入的冷却记录。
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            "SELECT * FROM display_names WHERE id = ?",
+            (name_id,),
+        ).fetchone()
+
+        # 1. 记录未知或不属于 URL 中的命名空间
+        if row is None or row["namespace"] != namespace:
+            raise NameNotFoundError(name_id)
+
+        # 2. 乐观锁版本校验
+        current_revision = row["revision"]
+        if current_revision != expected_revision:
+            raise StaleRevisionError(current_revision)
+
+        # 持锁期间惰性清理过期冷却，使后续记录集只含有效冷却
+        purge_expired_cooldowns(conn, namespace)
+
+        created = utc_now()
+        expires_at = (created + timedelta(seconds=cooldown_seconds)).isoformat(
+            timespec="milliseconds"
+        ) + "Z"
+
+        cursor = conn.execute(
+            """
+            DELETE FROM display_names
+             WHERE id = ? AND namespace = ? AND revision = ?
+            """,
+            (name_id, namespace, expected_revision),
+        )
+        if cursor.rowcount != 1:
+            # 条件删除兜底（持写锁后理论上不会发生）：重读当前版本
+            refreshed = conn.execute(
+                "SELECT revision FROM display_names WHERE id = ? AND namespace = ?",
+                (name_id, namespace),
+            ).fetchone()
+            raise StaleRevisionError(
+                refreshed["revision"] if refreshed else current_revision
+            )
+
+        cursor = conn.execute(
+            """
+            INSERT INTO name_cooldowns
+                (namespace, original_name, normalized_name, cooldown_seconds, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                namespace,
+                row["original_name"],
+                row["normalized_name"],
+                cooldown_seconds,
+                expires_at,
+            ),
+        )
+        new_id = cursor.lastrowid
+        conn.commit()
+    except (NameNotFoundError, StaleRevisionError):
+        conn.rollback()
+        raise
+    except (sqlite3.IntegrityError, sqlite3.OperationalError) as exc:
+        # 锁竞争：回滚，按并发冲突处理（客户端重读后重试）
+        conn.rollback()
+        raise NameConflictError(str(exc)) from exc
+
+    record = conn.execute(
+        "SELECT * FROM name_cooldowns WHERE id = ?", (new_id,)
+    ).fetchone()
+    return dict(record)
+
+
+def list_cooldowns(conn: sqlite3.Connection, namespace: str) -> list[dict]:
+    """只读列出命名空间内仍有效的释放冷却记录（按 id 升序）。
+
+    过期记录不出现在结果中，但只读接口不做物理删除（惰性清理统一由写
+    事务负责）。
+    """
+    moment = utc_now()
+    rows = conn.execute(
+        "SELECT * FROM name_cooldowns WHERE namespace = ? ORDER BY id",
+        (namespace,),
+    ).fetchall()
+    return [
+        dict(row)
+        for row in rows
+        if parse_expires_at(row["expires_at"]) > moment
+    ]
