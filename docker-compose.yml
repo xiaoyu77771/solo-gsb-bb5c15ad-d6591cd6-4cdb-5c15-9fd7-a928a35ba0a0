@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: unicode-name-guard:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/names.db
+    volumes:
+      - names-data:/data
+    restart: unless-stopped
+
+volumes:
+  names-data:
