@@ -52,6 +52,33 @@ class RenameRequest(BaseModel):
     )
 
 
+# 释放名称的冷却时长边界（与 service 层常量保持一致）
+MIN_COOLDOWN_SECONDS = 60
+MAX_COOLDOWN_SECONDS = 86400
+
+
+class ReleaseNameRequest(BaseModel):
+    """删除（释放）名称请求体：乐观锁版本 + 冷却时长（60–86400 秒）。"""
+
+    expected_revision: int = Field(
+        ge=1,
+        examples=[1],
+        description=(
+            "调用方上次读取到的 revision；与当前值一致才执行删除，"
+            "删除成功后原规范名进入冷却"
+        ),
+    )
+    cooldown_seconds: int = Field(
+        ge=MIN_COOLDOWN_SECONDS,
+        le=MAX_COOLDOWN_SECONDS,
+        examples=[3600],
+        description=(
+            "释放冷却时长（秒），范围 60–86400；到期前该规范名与已注册名称、"
+            "有效预占同等参与全部冲突与混脚本判定"
+        ),
+    )
+
+
 class BatchNameRequest(BaseModel):
     """批量注册请求体：1–50 个名称，全部通过才落库。"""
 
@@ -158,9 +185,9 @@ class ConflictRecord(BaseModel):
     original_name: str
     normalized_name: str
     reason: Literal["normalized_match", "confusable"]
-    # 冲突来源：已注册名称（默认，向后兼容）或仍有效的预占
-    source: Literal["registered", "reservation"] = "registered"
-    # 仅 source == "reservation" 时出现：预占过期时刻（UTC ISO 8601）
+    # 冲突来源：已注册名称（默认，向后兼容）、仍有效的预占，或删除后的冷却记录
+    source: Literal["registered", "reservation", "released"] = "registered"
+    # source 为 reservation / released 时出现：记录过期时刻（UTC ISO 8601）
     expires_at: str | None = None
 
 
@@ -201,6 +228,18 @@ class ReservationRecord(BaseModel):
     normalized_name: str
     token: str
     ttl_seconds: int
+    expires_at: str
+    created_at: str
+
+
+class CooldownRecord(BaseModel):
+    """释放冷却记录：删除名称后生成，expires_at 前持续占位。"""
+
+    id: int
+    namespace: str
+    original_name: str
+    normalized_name: str
+    cooldown_seconds: int
     expires_at: str
     created_at: str
 
@@ -261,6 +300,9 @@ class MergeResult(BaseModel):
     merged_names: int = Field(description="迁移的已注册名称数量")
     merged_reservations: int = Field(
         description="迁移的预占记录数量（含已消费的历史记录；过期记录已惰性清理，不迁移）"
+    )
+    merged_cooldowns: int = Field(
+        description="迁移的释放冷却记录数量（未过期记录；过期记录已惰性清理，不迁移）"
     )
 
 

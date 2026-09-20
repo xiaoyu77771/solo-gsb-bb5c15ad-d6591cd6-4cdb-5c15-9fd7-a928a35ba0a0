@@ -2293,3 +2293,600 @@ def test_openapi_documents_script_policy_endpoints(client):
     assert "422" in put_op["responses"]
     assert "200" in get_op["responses"]
     assert "404" in get_op["responses"]
+
+
+# ---------- 释放名称与冷却 DELETE /namespaces/{namespace}/names/{id} ----------
+
+
+def release(client, name_id, expected_revision, cooldown_seconds=3600, namespace="chat"):
+    return client.request(
+        "DELETE",
+        f"/namespaces/{namespace}/names/{name_id}",
+        json={
+            "expected_revision": expected_revision,
+            "cooldown_seconds": cooldown_seconds,
+        },
+    )
+
+
+def expire_cooldowns():
+    conn = database.get_connection()
+    try:
+        conn.execute(
+            "UPDATE released_name_cooldowns SET expires_at = '2000-01-01T00:00:00.000Z'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_release_success_deletes_name_and_creates_cooldown(client):
+    created = register(client, "Alice").json()
+
+    resp = release(client, created["id"], expected_revision=1, cooldown_seconds=60)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["namespace"] == "chat"
+    assert body["original_name"] == "Alice"
+    assert body["normalized_name"] == "alice"
+    assert body["cooldown_seconds"] == 60
+    assert body["id"] >= 1
+    assert body["created_at"]
+    assert body["expires_at"].endswith("Z")
+    assert body["expires_at"] > body["created_at"]
+
+    # 已注册名称已删除，冷却记录可列出
+    assert client.get("/namespaces/chat/names").json() == []
+    cooldowns = client.get("/namespaces/chat/cooldowns").json()
+    assert len(cooldowns) == 1
+    assert cooldowns[0]["original_name"] == "Alice"
+    assert cooldowns[0]["expires_at"] == body["expires_at"]
+
+
+def test_release_cooldown_bounds_validated(client):
+    first = register(client, "a").json()
+    second = register(client, "b").json()
+    third = register(client, "c").json()
+    assert release(client, first["id"], 1, cooldown_seconds=60).status_code == 200
+    assert release(client, second["id"], 1, cooldown_seconds=86400).status_code == 200
+    # 越界 / 非正 expected_revision -> 422，名称不删除
+    resp = release(client, third["id"], 1, cooldown_seconds=59)
+    assert resp.status_code == 422
+    resp = release(client, third["id"], 1, cooldown_seconds=86401)
+    assert resp.status_code == 422
+    resp = release(client, third["id"], 0, cooldown_seconds=60)
+    assert resp.status_code == 422
+    assert client.get("/namespaces/chat/names").json()[0]["original_name"] == "c"
+
+
+def test_release_unknown_id_returns_404(client):
+    resp = release(client, 999, expected_revision=1)
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "name_not_found"
+
+
+def test_release_id_from_other_namespace_returns_404_and_changes_nothing(client):
+    created = register(client, "Alice", namespace="a").json()
+    resp = release(client, created["id"], expected_revision=1, namespace="b")
+    assert resp.status_code == 404
+    # 记录仍在原命名空间，也没有冷却记录
+    names = client.get("/namespaces/a/names").json()
+    assert [n["original_name"] for n in names] == ["Alice"]
+    assert client.get("/namespaces/a/cooldowns").json() == []
+
+
+def test_release_stale_revision_returns_409_with_current_revision(client):
+    created = register(client, "Alice").json()
+
+    resp = release(client, created["id"], expected_revision=99, cooldown_seconds=60)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "stale_revision"
+    assert detail["current_revision"] == 1
+    # 版本过期不删除名称、不生成冷却
+    assert [n["id"] for n in client.get("/namespaces/chat/names").json()] == [created["id"]]
+    assert client.get("/namespaces/chat/cooldowns").json() == []
+
+
+def test_release_is_atomic_and_bumps_nothing_on_failure(client, monkeypatch):
+    """服务层：版本过期时不删除名称也不写冷却，记录保持原样。"""
+    conn = database.get_connection()
+    try:
+        record = service.register_name(conn, "chat", "Alice", "alice")
+        with pytest.raises(service.StaleRevisionError) as exc_info:
+            service.release_name(conn, "chat", record["id"], 99, 3600)
+        assert exc_info.value.current_revision == 1
+        with pytest.raises(service.NameNotFoundError):
+            service.release_name(conn, "other", record["id"], 1, 3600)
+        # 失败后名称仍在，冷却表为空
+        assert [r["original_name"] for r in service.list_names(conn, "chat")] == ["Alice"]
+        assert service.list_cooldowns(conn, "chat") == []
+        # 成功路径：删除并返回冷却记录
+        cooldown = service.release_name(conn, "chat", record["id"], 1, 3600)
+        assert cooldown["original_name"] == "Alice"
+        assert service.list_names(conn, "chat") == []
+        assert len(service.list_cooldowns(conn, "chat")) == 1
+    finally:
+        conn.close()
+
+
+def test_release_concurrent_requests_exactly_one_wins(client):
+    created = register(client, "Alice").json()
+
+    def delete_one(_):
+        return release(client, created["id"], expected_revision=1, cooldown_seconds=60)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(delete_one, range(8)))
+
+    codes = [resp.status_code for resp in responses]
+    assert codes.count(200) == 1
+    # 落败者：持锁前读到记录的返回 409 stale_revision，持锁时记录已被
+    # 删除的返回 404 name_not_found；二者都表示“只有一次删除成功”
+    assert set(codes) <= {200, 409, 404}
+    assert not any(code >= 500 for code in codes)
+    # 名称只删除一次，只有一条冷却记录
+    assert client.get("/namespaces/chat/names").json() == []
+    assert len(client.get("/namespaces/chat/cooldowns").json()) == 1
+
+
+def test_cooldown_blocks_single_register_with_normalized_match(client):
+    created = register(client, "Alice").json()
+    cooldown = release(client, created["id"], 1, cooldown_seconds=3600).json()
+
+    resp = register(client, "ALICE")
+    assert resp.status_code == 409
+    conflict = resp.json()["detail"]["conflicts"][0]
+    assert conflict["source"] == "released"
+    assert conflict["reason"] == "normalized_match"
+    assert conflict["original_name"] == "Alice"
+    assert conflict["expires_at"] == cooldown["expires_at"]
+    assert client.get("/namespaces/chat/names").json() == []
+
+
+def test_cooldown_blocks_register_with_confusable(client):
+    created = register(client, "app").json()
+    release(client, created["id"], 1, cooldown_seconds=3600)
+
+    resp = register(client, CYRILLIC_APP)
+    assert resp.status_code == 409
+    conflict = resp.json()["detail"]["conflicts"][0]
+    assert conflict["source"] == "released"
+    assert conflict["reason"] == "confusable"
+
+
+def test_cooldown_blocks_new_reservation(client):
+    created = register(client, "app").json()
+    release(client, created["id"], 1, cooldown_seconds=3600)
+
+    resp = reserve(client, CYRILLIC_APP)
+    assert resp.status_code == 409
+    conflict = resp.json()["detail"]["conflicts"][0]
+    assert conflict["source"] == "released"
+    assert conflict["reason"] == "confusable"
+
+
+def test_cooldown_blocks_batch_register_and_is_marked_per_item(client):
+    created = register(client, "app").json()
+    release(client, created["id"], 1, cooldown_seconds=3600)
+
+    resp = register_batch(client, ["hello", CYRILLIC_APP])
+    assert resp.status_code == 422
+    items = resp.json()["detail"]["items"]
+    assert items[0]["index"] == 1
+    conflict = items[0]["conflicts"][0]
+    assert conflict["source"] == "released"
+    assert conflict["reason"] == "confusable"
+    # 整批不落库
+    assert client.get("/namespaces/chat/names").json() == []
+
+
+def test_cooldown_blocks_rename(client):
+    victim = register(client, "app").json()
+    keeper = register(client, "keeper").json()
+    release(client, victim["id"], 1, cooldown_seconds=3600)
+
+    resp = rename(client, keeper["id"], "APP", expected_revision=1)
+    assert resp.status_code == 409
+    conflict = resp.json()["detail"]["conflicts"][0]
+    assert conflict["source"] == "released"
+    assert conflict["reason"] == "normalized_match"
+    # 改名失败：revision 不变
+    assert client.get("/namespaces/chat/names").json()[0]["revision"] == 1
+
+
+def test_cooldown_appears_in_check(client):
+    created = register(client, "app").json()
+    release(client, created["id"], 1, cooldown_seconds=3600)
+
+    resp = client.post("/namespaces/chat/check", json={"name": CYRILLIC_APP})
+    assert resp.status_code == 200
+    conflicts = resp.json()["conflicts"]
+    assert len(conflicts) == 1
+    assert conflicts[0]["source"] == "released"
+    assert conflicts[0]["reason"] == "confusable"
+    assert conflicts[0]["expires_at"].endswith("Z")
+
+
+def test_cooldown_is_namespace_isolated(client):
+    created = register(client, "app", namespace="a").json()
+    release(client, created["id"], 1, namespace="a")
+    # 其他命名空间不受冷却影响
+    assert register(client, "app", namespace="b").status_code == 201
+    assert reserve(client, CYRILLIC_APP, namespace="b").status_code == 409  # 与 b 内注册名冲突
+    # a 空间仍被冷却拦截
+    assert register(client, "app", namespace="a").status_code == 409
+    assert client.get("/namespaces/b/cooldowns").json() == []
+    assert len(client.get("/namespaces/a/cooldowns").json()) == 1
+
+
+def test_conflicts_are_ordered_registered_reservation_released(client):
+    """三类记录在冲突明细中的顺序：registered -> reservation -> released。
+
+    同空间内三类同形记录无法经正常接口共存（注册 / 预占互斥），这里直接
+    写库模拟历史数据 / 并发状态下三者同时存在时的排序行为。
+    """
+    conn = database.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO display_names (namespace, original_name, normalized_name) "
+            "VALUES ('chat', 'reg', 'dup')"
+        )
+        conn.execute(
+            "INSERT INTO name_reservations "
+            "(namespace, original_name, normalized_name, token, expires_at) "
+            "VALUES ('chat', 'res', 'dup', 'tok-res', '2999-01-01T00:00:00.000Z')"
+        )
+        conn.execute(
+            "INSERT INTO released_name_cooldowns "
+            "(namespace, original_name, normalized_name, cooldown_seconds, expires_at) "
+            "VALUES ('chat', 'rel', 'dup', 3600, '2999-01-01T00:00:00.000Z')"
+        )
+        conn.commit()
+
+        conflicts = service.find_conflicts(conn, "chat", "dup")
+    finally:
+        conn.close()
+    assert [c["source"] for c in conflicts] == ["registered", "reservation", "released"]
+    assert all(c["reason"] == "normalized_match" for c in conflicts)
+    assert conflicts[1]["expires_at"] == "2999-01-01T00:00:00.000Z"
+    assert conflicts[2]["expires_at"] == "2999-01-01T00:00:00.000Z"
+
+
+def test_expired_cooldown_does_not_block_and_is_purged_on_next_write(client):
+    created = register(client, "Alice").json()
+    release(client, created["id"], 1, cooldown_seconds=60)
+    expire_cooldowns()
+
+    # check 是只读的：过期冷却不出现，但记录尚未被物理删除
+    resp = client.post("/namespaces/chat/check", json={"name": "alice"})
+    assert resp.json()["conflicts"] == []
+    assert client.get("/namespaces/chat/cooldowns").json() == []
+    conn = database.get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM released_name_cooldowns").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    # 下一次写操作（注册）在写锁事务内惰性清理，名称可重新注册
+    resp = register(client, "Alice")
+    assert resp.status_code == 201
+    conn = database.get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM released_name_cooldowns").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_expired_cooldown_is_purged_by_reservation_and_claim(client):
+    created = register(client, "Alice").json()
+    release(client, created["id"], 1, cooldown_seconds=60)
+    expire_cooldowns()
+
+    # 预占写事务同样惰性清理
+    resp = reserve(client, "Alice", ttl_seconds=60)
+    assert resp.status_code == 201
+    conn = database.get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM released_name_cooldowns").fetchone()[0] == 0
+    finally:
+        conn.close()
+    # 确认注册成功
+    assert claim(client, resp.json()["token"]).status_code == 201
+
+
+def test_active_reservation_created_then_name_released_coexistence_blocks(client):
+    """释放的名称与一条无关的有效预占共存：二者分别在冲突明细中出现。"""
+    alice = register(client, "Alice").json()
+    reservation = reserve(client, "carol", ttl_seconds=120).json()
+    cooldown = release(client, alice["id"], 1, cooldown_seconds=3600)
+
+    # 批量同时撞两类：批内两个名字分别命中
+    resp = register_batch(client, ["ALICE", "CAROL"])
+    assert resp.status_code == 422
+    items = {item["index"]: item for item in resp.json()["detail"]["items"]}
+    assert items[0]["conflicts"][0]["source"] == "released"
+    assert items[1]["conflicts"][0]["source"] == "reservation"
+    assert items[1]["conflicts"][0]["expires_at"] == reservation["expires_at"]
+    assert items[0]["conflicts"][0]["expires_at"] == cooldown.json()["expires_at"]
+
+
+# ---------- 冷却参与命名空间合并 ----------
+
+
+def test_merge_migrates_active_cooldowns_and_counts_them(client):
+    created = register(client, "carol", namespace="a").json()
+    cooldown = release(client, created["id"], 1, cooldown_seconds=3600, namespace="a").json()
+    assert register(client, "erin", namespace="b").status_code == 201
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["merged_names"] == 0
+    assert body["merged_cooldowns"] == 1
+
+    # 冷却记录迁入目标空间并继续占位
+    assert client.get("/namespaces/a/cooldowns").json() == []
+    moved = client.get("/namespaces/b/cooldowns").json()
+    assert len(moved) == 1
+    assert moved[0]["id"] == cooldown["id"]
+    assert moved[0]["original_name"] == "carol"
+    resp = register(client, "CAROL", namespace="b")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["conflicts"][0]["source"] == "released"
+
+
+def test_merge_conflict_with_active_cooldown_on_either_side(client):
+    # 源侧冷却 vs 目标侧已注册名称（同形）
+    created = register(client, "app", namespace="a").json()
+    release(client, created["id"], 1, cooldown_seconds=3600, namespace="a")
+    assert register(client, CYRILLIC_APP, namespace="b").status_code == 201
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 409
+    pair = resp.json()["detail"]["conflicts"][0]
+    assert pair["reason"] == "confusable"
+    assert pair["source_record"]["kind"] == "released"
+    assert pair["target_record"]["kind"] == "registered"
+    assert pair["source_record"]["expires_at"].endswith("Z")
+
+    # 反向：目标侧冷却 vs 源侧已注册名称
+    other = register(client, "app", namespace="c").json()
+    victim = register(client, CYRILLIC_APP, namespace="d").json()
+    release(client, victim["id"], 1, cooldown_seconds=3600, namespace="d")
+    resp = merge(client, "c", "d")
+    assert resp.status_code == 409
+    pair = resp.json()["detail"]["conflicts"][0]
+    assert pair["source_record"]["kind"] == "registered"
+    assert pair["target_record"]["kind"] == "released"
+    # 两侧数据未变
+    assert [n["id"] for n in client.get("/namespaces/c/names").json()] == [other["id"]]
+    assert client.get("/namespaces/c/cooldowns").json() == []
+
+
+def test_merge_expired_cooldown_does_not_block_and_is_purged(client):
+    created = register(client, "app", namespace="a").json()
+    release(client, created["id"], 1, cooldown_seconds=60, namespace="a")
+    expire_cooldowns()
+    # 目标侧同形名：过期冷却不应阻止合并
+    assert register(client, CYRILLIC_APP, namespace="b").status_code == 201
+
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 200
+    assert resp.json()["merged_cooldowns"] == 0  # 过期记录被惰性清理，不迁移
+    conn = database.get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM released_name_cooldowns").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_merge_script_violation_includes_source_cooldown(client):
+    # 源空间放宽策略，注册一个混写名称后删除（冷却记录保留原名，仍混脚本）
+    assert put_policy(client, [], 0, namespace="a").status_code == 200
+    created = register(client, MIXED_ADMIN, namespace="a").json()
+    release(client, created["id"], 1, cooldown_seconds=3600, namespace="a")
+
+    # 目标 b 保持默认严格策略：冷却记录原名违规 -> 409，且不迁移
+    resp = merge(client, "a", "b")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["conflicts"] == []
+    (violation,) = detail["script_violations"]
+    assert violation["side"] == "source"
+    assert violation["record"]["kind"] == "released"
+    assert violation["record"]["original_name"] == MIXED_ADMIN
+    assert violation["record"]["expires_at"].endswith("Z")
+    assert violation["violating_script_pairs"] == [["Cyrillic", "Latin"]]
+    # 冷却未迁移
+    assert len(client.get("/namespaces/a/cooldowns").json()) == 1
+    assert client.get("/namespaces/b/cooldowns").json() == []
+
+
+# ---------- 冷却参与脚本策略更新 ----------
+
+
+def test_put_policy_violating_active_cooldown_blocks_update(client):
+    # 默认策略下放行 Han+Latin：注册后删除并冷却，再收紧策略 -> 命中冷却记录
+    created = register(client, "世界-r", namespace="chat").json()
+    cooldown = release(client, created["id"], 1, cooldown_seconds=3600).json()
+
+    resp = put_policy(client, [["Han", "Latin"]], expected_revision=0)
+    assert resp.status_code == 409
+    (violation,) = resp.json()["detail"]["violations"]
+    assert violation["kind"] == "released"
+    assert violation["id"] == cooldown["id"]
+    assert violation["original_name"] == "世界-r"
+    assert violation["expires_at"] == cooldown["expires_at"]
+    assert violation["violating_script_pairs"] == [["Han", "Latin"]]
+    # 策略未创建
+    assert get_policy(client).status_code == 404
+
+
+def test_put_policy_purges_expired_cooldowns_before_scan(client):
+    created = register(client, "世界-r").json()
+    release(client, created["id"], 1, cooldown_seconds=60)
+    expire_cooldowns()
+
+    # 过期冷却在写事务内先惰性清理，不再阻止策略收紧
+    resp = put_policy(client, [["Han", "Latin"]], expected_revision=0)
+    assert resp.status_code == 200
+    conn = database.get_connection()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM released_name_cooldowns").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_put_policy_scan_order_registered_reservation_released(client):
+    register(client, "世界-a")
+    reserve(client, "世界-b")
+    gone = register(client, "世界-c").json()
+    release(client, gone["id"], 1, cooldown_seconds=3600)
+    resp = put_policy(client, [["Han", "Latin"]], expected_revision=0)
+    assert resp.status_code == 409
+    kinds = [v["kind"] for v in resp.json()["detail"]["violations"]]
+    assert kinds == ["registered", "reservation", "released"]
+
+
+# ---------- 迁移 / 文档 ----------
+
+
+def test_init_db_creates_cooldown_table_idempotently(tmp_path):
+    """新库自动建冷却表与索引，重复初始化不报错。"""
+    db_path = tmp_path / "cooldown.db"
+    database.init_db(str(db_path))
+    database.init_db(str(db_path))
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "released_name_cooldowns" in tables
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        assert "idx_released_cooldowns_namespace" in indexes
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(released_name_cooldowns)")}
+        assert {
+            "id", "namespace", "original_name", "normalized_name",
+            "cooldown_seconds", "expires_at", "created_at",
+        } <= cols
+
+
+def test_init_db_migrates_legacy_database_with_cooldown_table(tmp_path):
+    """老版本数据库（无冷却表）启动后自动获得冷却表，既有数据不受影响。"""
+    db_path = tmp_path / "legacy-cooldown.db"
+    import sqlite3
+
+    with sqlite3.connect(db_path) as legacy:
+        legacy.execute(
+            """
+            CREATE TABLE display_names (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace       TEXT NOT NULL,
+                original_name   TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT '',
+                UNIQUE (namespace, normalized_name)
+            )
+            """
+        )
+        legacy.execute(
+            "INSERT INTO display_names (namespace, original_name, normalized_name) "
+            "VALUES ('chat', 'Alice', 'alice')"
+        )
+        legacy.commit()
+
+    database.init_db(str(db_path))  # 幂等迁移
+    database.init_db(str(db_path))
+
+    with sqlite3.connect(db_path) as migrated:
+        tables = {
+            row[0]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "released_name_cooldowns" in tables
+        # 既有名称原样保留（revision 列也按既有迁移补齐）
+        row = migrated.execute(
+            "SELECT original_name, revision FROM display_names"
+        ).fetchone()
+        assert row == ("Alice", 1)
+
+
+def test_release_after_rename_requires_updated_revision(client):
+    created = register(client, "Alice").json()
+    renamed = rename(client, created["id"], "Alicia", expected_revision=1).json()
+    assert renamed["revision"] == 2
+
+    # 旧版本删除 -> 409，附当前 revision=2
+    resp = release(client, created["id"], expected_revision=1, cooldown_seconds=60)
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["current_revision"] == 2
+    # 名称仍在
+    assert [n["id"] for n in client.get("/namespaces/chat/names").json()] == [created["id"]]
+
+    # 新版本删除成功，冷却记录保留改名后的原名 / 规范名
+    resp = release(client, created["id"], expected_revision=2, cooldown_seconds=60)
+    assert resp.status_code == 200
+    cooldown = resp.json()
+    assert cooldown["original_name"] == "Alicia"
+    assert cooldown["normalized_name"] == "alicia"
+    assert client.get("/namespaces/chat/names").json() == []
+
+
+def test_release_purges_expired_cooldowns_of_same_namespace(client):
+    first = register(client, "Alice").json()
+    release(client, first["id"], 1, cooldown_seconds=60)
+    expire_cooldowns()
+
+    # 用另一个名字的删除触发写事务：顺手清理过期冷却
+    second = register(client, "Bob").json()
+    resp = release(client, second["id"], 1, cooldown_seconds=60)
+    assert resp.status_code == 200
+    conn = database.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT original_name FROM released_name_cooldowns ORDER BY id"
+        ).fetchall()
+        assert [row[0] for row in rows] == ["Bob"]  # 旧的 Alice 冷却已清理
+    finally:
+        conn.close()
+
+
+def test_cooldown_allows_reregister_only_after_expiry_purge_then_blocks_again(client):
+    created = register(client, "Alice").json()
+    release(client, created["id"], 1, cooldown_seconds=60)
+    expire_cooldowns()
+
+    # 过期 -> 可重新注册（写事务清理旧冷却）
+    reregistered = register(client, "Alice")
+    assert reregistered.status_code == 201
+    # 再次删除 -> 新冷却继续占位，新 id
+    second_cd = release(
+        client, reregistered.json()["id"], 1, cooldown_seconds=3600
+    ).json()
+    assert register(client, "ALICE").status_code == 409
+    cooldowns = client.get("/namespaces/chat/cooldowns").json()
+    assert len(cooldowns) == 1
+    assert cooldowns[0]["id"] == second_cd["id"]
+
+
+def test_openapi_documents_release_and_cooldown_endpoints(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    delete_op = paths["/namespaces/{namespace}/names/{name_id}"]["delete"]
+    assert "200" in delete_op["responses"]
+    assert "404" in delete_op["responses"]
+    assert "409" in delete_op["responses"]
+    assert "422" in delete_op["responses"]
+    get_op = paths["/namespaces/{namespace}/cooldowns"]["get"]
+    assert "200" in get_op["responses"]
